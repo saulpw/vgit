@@ -1,6 +1,6 @@
 # vgit v0.2
 
-vgit is a sleek terminal user interface for git, supplanting the arcana of git command-line operations with intuitive keystrokes. It was built using the [VisiData tui](https://github.com/saulpw/visidata/blob/stable/visidata/vd.py) as a platform.
+vgit is a sleek terminal user interface for git, supplanting the arcana of git command-line operations with intuitive keystrokes. It was built using the [VisiData tui](https://github.com/saulpw/visidata/blob/v0.96/visidata/vdtui.py) as a platform.
 
 Current features include:
 - viewing, stashing, staging, unstaging, and committing of diff hunks.
