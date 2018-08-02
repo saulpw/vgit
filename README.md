@@ -1,4 +1,4 @@
-# vgit v0.2
+# vgit v0.2.1
 
 vgit is a sleek terminal user interface for git, supplanting the arcana of git command-line operations with intuitive keystrokes. It was built using the [VisiData tui](https://github.com/saulpw/visidata/blob/v0.96/visidata/vdtui.py) as a platform.
 
@@ -42,4 +42,3 @@ Further documentation is available [here](vgit-guide.md).
 ## License
 
 vgit is released under a GPLv3 license.
-
