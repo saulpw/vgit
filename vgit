@@ -8,7 +8,7 @@ from git import *
 from merge import GitMerge
 from blame import GitBlame
 
-__version__ = 'saul.pw/vgit v0.2'
+__version__ = 'saul.pw/vgit v0.2.1'
 
 option('vgit_show_ignored', False)
 option('diff_algorithm', 'minimal')
@@ -79,7 +79,7 @@ class LogSheet(GitSheet):
     def inRemoteBranch(self, commitid):
         return git_all('branch', '-r', '--contains', commitid)
 
-    @async
+    @asyncthread
     def reload(self):
         self.rows = []
         for record in git_iter('\0', 'log', '--no-color', '-z', '--pretty=format:%s' % '%x1f'.join(self.GIT_LOG_FORMAT), self.source):
@@ -110,7 +110,7 @@ class GitBranches(GitSheet):
         self.addColorizer('row', 10, lambda s,c,r,v: 'underline' if r[0] else None)
         self.addColorizer('row', 10, lambda s,c,r,v: 'cyan' if not r[1].startswith('remotes/') else None)
 
-    @async
+    @asyncthread
     def reload(self):
         self.rows = []
         for line in git_lines('branch', '--list', '-vv', '--no-color', '--all'):

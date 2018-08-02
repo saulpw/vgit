@@ -2,7 +2,7 @@
 
 from setuptools import setup
 
-__version__ = '0.2'
+__version__ = '0.2.1'
 
 setup(name='vgit',
       version=__version__,
