@@ -352,7 +352,7 @@ def sync():
     while len(vd().unfinishedThreads) > 0:
         vd().checkForFinishedThreads()
 
-def async(func):
+def asyncthread(func):
     'Function decorator, to make calls to `func()` spawn a separate thread if available.'
     def _execAsync(*args, **kwargs):
         return vd().execAsync(func, *args, **kwargs)
@@ -822,7 +822,7 @@ class Sheet:
         c.colorizers = self.colorizers.copy()
         return c
 
-    @async
+    @asyncthread
     def deleteSelected(self):
         'Delete all selected rows.'
         oldrows = self.rows
@@ -989,7 +989,7 @@ class Sheet:
         'Return boolean: is current row selected?'
         return id(r) in self._selectedRows
 
-    @async
+    @asyncthread
     def toggle(self, rows):
         'Select any unselected rows.'
         for r in self.genProgress(rows, len(self.rows)):
@@ -1008,7 +1008,7 @@ class Sheet:
         else:
             return False
 
-    @async
+    @asyncthread
     def select(self, rows, status=True, progress=True):
         'Select given rows with option for progress-tracking.'
         before = len(self._selectedRows)
@@ -1017,7 +1017,7 @@ class Sheet:
         if status:
             self.vd.status('selected %s%s rows' % (len(self._selectedRows)-before, ' more' if before > 0 else ''))
 
-    @async
+    @asyncthread
     def unselect(self, rows, status=True, progress=True):
         'Unselect given rows with option for progress-tracking.'
         before = len(self._selectedRows)
@@ -1650,7 +1650,7 @@ def clipstr(s, dispw):
 class TextSheet(Sheet):
     'Sheet displaying a string (one line per row) or a list of strings.'
 
-    @async
+    @asyncthread
     def reload(self):
         'Populate sheet via `reload` function.'
         self.rows = []

@@ -81,7 +81,7 @@ class GitSheet(Sheet):
         self.extra_args = []
         self.command('f', 'extra_args.append("--force"); status("--force next git command")', 'add --force to next git command')
 
-    @async
+    @asyncthread
     def git(self, *args, **kwargs):
         args = list(args) + self.extra_args
         self.extra_args.clear()
@@ -254,7 +254,7 @@ class GitStatus(GitSheet):
 
         return ret
 
-    @async
+    @asyncthread
     def reload(self):
         files = [GitFile(p, self.source) for p in self.source.iterdir() if p.name not in ('.git', '..')]  # files in working dir
 
