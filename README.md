@@ -1,3 +1,5 @@
+# vgit is now at [saulpw/visidata/vgit](https://github.com/saulpw/visidata/tree/develop/vgit)
+
 # vgit v0.2
 
 vgit is a sleek terminal user interface for git, supplanting the arcana of git command-line operations with intuitive keystrokes. It was built using the [VisiData tui](https://github.com/saulpw/visidata/blob/stable/visidata/vd.py) as a platform.
