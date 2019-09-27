@@ -1,4 +1,9 @@
 # CHANGELOG
+## 0.3
+- log all git commands which vgit executes to gitcmd.log
+- git log sheet
+    - `Shift-C` amends the selected commit to contain the currently staged changes
+    - `r` resets the shown branch HEAD to the selected commit
 
 ## v0.2 (2017-08-23)
 - vgit auto pushes a full sheet of statuses if the status is more than 3 lines
@@ -12,7 +17,7 @@
     - `Ctrl-p`ops the most recent stashed change and drops it
     - `A`bort the current in-progress action
     - `T` pushes the stashes sheet
-    - `L` pushes the git blame sheet
+    - `L` pushes the blame sheet
 - git status sheet
     - provides information about the working tree
     - `r` to unstage a file (instead of `w`)

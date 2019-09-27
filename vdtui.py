@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright 2017 Saul Pwanson
+# Copyright 2017 Saul Pwanson  http://saul.pw/vdtui
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -21,9 +21,12 @@
 # SOFTWARE.
 #
 
-'VisiData core functionality'
+'vdtui: a curses framework for columnar data'
 
-__version__ = 'saul.pw/vdtui v0.95.1'
+# Just include this whole file in your project as-is.  If you do make
+# modifications, please keep the base vdtui version and append your own id and
+# version.
+__version__ = 'saul.pw/vdtui v0.99+'
 __author__ = 'Saul Pwanson <vdtui@saul.pw>'
 __license__ = 'MIT'
 __status__ = 'Beta'
@@ -31,230 +34,297 @@ __status__ = 'Beta'
 from builtins import *
 import sys
 import os
-import os.path
-import copy
 import collections
+from copy import copy, deepcopy
+from contextlib import suppress
+import curses
+import datetime
 import functools
-import gzip
+import io
 import itertools
 import string
 import re
-import time
-import curses
-import datetime
-import io
 import textwrap
 import threading
+import traceback
+import time
 
-class EscapeException(Exception):
+class EscapeException(BaseException):
+    'Inherits from BaseException to avoid "except Exception" clauses.  Do not use a blanket "except:" or the task will be uncancelable.'
     pass
 
-baseCommands = collections.OrderedDict()
-baseOptions = collections.OrderedDict()
+class ExpectedException(Exception):
+    'an expected exception'
+    pass
 
-def command(keystrokes, execstr, helpstr):
+baseCommands = collections.OrderedDict()  # [cmd.name] -> Command
+baseOptions = collections.OrderedDict()   # [opt.name] -> opt
+
+class Command:
+    def __init__(self, name, execstr, helpstr=''):
+        self.name = name
+        self.execstr = execstr
+        self.helpstr = helpstr
+
+def globalCommand(keystrokes, execstr, helpstr='', longname=None):
     if isinstance(keystrokes, str):
         keystrokes = [keystrokes]
 
+    if longname:
+        cmd = Command(longname, execstr, helpstr)
+        baseCommands[longname] = cmd
+        assert helpstr or (execstr in baseCommands), 'unknown longname ' + execstr
+        helpstr = ''
+
     for ks in keystrokes:
-        baseCommands[ks] = (ks, helpstr, execstr)
-
-def alias(new, existing):
-    _, helpstr, execstr = baseCommands[existing]
-    command(new, execstr, helpstr)
-
-
-class configbool:
-    def __init__(self, v):
-        if isinstance(v, str):
-            self.val = v and (v[0] not in "0fFnN")
-        else:
-            self.val = bool(v)
-
-    def __bool__(self):
-        return self.val
-
-    def __str__(self):
-        return str(self.val)
-
+        baseCommands[ks] = Command(ks, longname or execstr, helpstr)
 
 def option(name, default, helpstr=''):
-    if isinstance(default, bool):
-        default = configbool(default)
+    baseOptions[name] = [name, default, default, helpstr]
 
-    baseOptions[name] = [name, default, default, helpstr]  # see OptionsObject
 
+class OptionsObject:
+    'minimalist options framework'
+    def __init__(self, d):
+        object.__setattr__(self, '_opts', d)
+
+    def __getattr__(self, k):      # options.foo
+        name, value, default, helpstr = self._opts[k]
+        return value
+
+    def __setattr__(self, k, v):   # options.foo = v
+        self.__setitem__(k, v)
+
+    def __setitem__(self, k, v):   # options[k] = v
+        if k not in self._opts:
+            raise Exception('no such option "%s"' % k)
+
+        curval = self._opts[k][1]
+        t = type(curval)
+        if isinstance(v, str) and t is bool: # special case for bool options
+            v = v and (v[0] not in "0fFnN")  # ''/0/false/no are false, everything else is true
+        elif curval is not None:             # if None, do not apply type conversion
+            v = t(v)
+
+        self._opts[k][1] = v
+
+options = OptionsObject(baseOptions)
+
+alias = globalCommand
 theme = option
-
-option('debug', False, 'abort on error and display stacktrace')
-option('readonly', False, 'disable saving')
 
 option('encoding', 'utf-8', 'as passed to codecs.open')
 option('encoding_errors', 'surrogateescape', 'as passed to codecs.open')
 
-option('field_joiner', ' ', 'character used to join string fields')
-option('sheetname_joiner', '~', 'string joining multiple sheet names')
-option('curses_timeout', 100, 'curses timeout in ms')
-
-option('default_width', 20, 'default column width')
 option('regex_flags', 'I', 'flags to pass to re.compile() [AILMSUX]')
-option('num_colors', 0, 'force number of colors to use')
-option('maxlen_col_hdr', 2, 'maximum length of column-header strings')
-option('textwrap', True, 'if TextSheet breaks rows to fit in windowWidth')
-option('force_valid_names', False, 'force column names to be valid Python identifiers')
+option('default_width', 20, 'default column width')
+option('wrap', False, 'wrap text to fit window width on TextSheet')
 
-theme('disp_truncator', '…')
-theme('disp_key_sep', '/')
-theme('disp_format_exc', '?')
-theme('disp_getter_exc', '!')
-theme('disp_edit_fill', '_', 'edit field fill character')
-theme('disp_more_left', '<', 'display cue in header indicating more columns to the left')
-theme('disp_more_right', '>', 'display cue in header indicating more columns to the right')
-theme('disp_column_sep', '|', 'chars between columns')
-theme('disp_keycol_sep', '\u2016', 'chars between keys and rest of columns')
+option('cmd_after_edit', 'j', 'command keystroke to execute after successful edit')
+option('cmdlog_longname', False, 'Use command longname in cmdlog if available')
 
-theme('disp_error_val', '¿', 'displayed contents when getter fails due to exception')
+option('none_is_null', True, 'if Python None counts as null')
+option('empty_is_null', False, 'if empty string counts as null')
+option('false_is_null', False, 'if Python False counts as null')
+option('zero_is_null', False, 'if integer 0 counts as null')
+
+
+option('force_valid_colnames', False, 'clean column names to be valid Python identifiers')
+option('debug', False, 'exit on error and display stacktrace')
+option('curses_timeout', 100, 'curses timeout in ms')
+theme('force_256_colors', False, 'use 256 colors even if curses reports fewer')
+theme('use_default_colors', False, 'set curses to use default terminal colors')
+
+disp_column_fill = ' ' # pad chars after column value
 theme('disp_none', '',  'visible contents of a cell whose value was None')
-
-theme('color_current_row', 'reverse')
-theme('color_default', 'normal')
-theme('color_selected_row', '215 yellow')
-theme('color_format_exc', '48 bold yellow')
-theme('color_getter_exc', 'red bold')
-theme('color_current_col', 'bold')
-theme('color_current_hdr', 'reverse underline')
-theme('color_key_col', '81 cyan')
-theme('color_default_hdr', 'bold underline')
-theme('color_column_sep', '246 blue')
-theme('disp_status_sep', ' | ', 'string separating multiple statuses')
-theme('disp_unprintable', '.', 'a substitute character for unprintables')
-theme('disp_column_fill', ' ', 'pad chars after column value')
+theme('disp_date_fmt','%Y-%m-%d', 'default fmtstr to strftime for date values')
+theme('disp_truncator', '…', 'indicator that the contents are only partially visible')
 theme('disp_oddspace', '\u00b7', 'displayable character for odd whitespace')
+theme('disp_unprintable', '.', 'substitute character for unprintables')
+theme('disp_column_sep', '|', 'separator between columns')
+theme('disp_keycol_sep', '\u2016', 'separator between keys and rest of columns')
+theme('disp_status_fmt', '{sheet.name}| ', 'status line prefix')
+theme('disp_status_sep', ' | ', 'separator between statuses')
+theme('disp_edit_fill', '_', 'edit field fill character')
+theme('disp_more_left', '<', 'header note indicating more columns to the left')
+theme('disp_more_right', '>', 'header note indicating more columns to the right')
+theme('disp_error_val', '¿', 'displayed contents for computation exception')
+theme('disp_ambig_width', 1, 'width to use for unicode chars marked ambiguous')
+
+theme('color_default', 'normal', 'the default color')
+theme('color_default_hdr', 'bold underline', 'color of the column headers')
+theme('color_current_row', 'reverse', 'color of the cursor row')
+theme('color_current_col', 'bold', 'color of the cursor column')
+theme('color_current_hdr', 'reverse underline', 'color of the header for the cursor column')
+theme('color_column_sep', '246 blue', 'color of column separators')
+theme('color_key_col', '81 cyan', 'color of key columns')
+theme('color_selected_row', '215 yellow', 'color of selected rows')
+
 theme('color_status', 'bold', 'status line color')
 theme('color_edit_cell', 'normal', 'edit cell color')
-theme('disp_status_fmt', '{sheet.name}| ', 'status line prefix')
-theme('unicode_ambiguous_width', 1, 'width to use for unicode chars marked ambiguous')
+
+theme('disp_pending', '', 'string to display in pending cells')
+theme('note_pending', '⌛', 'note to display for pending cells')
+theme('note_format_exc', '?', 'cell note for an exception during type conversion or formatting')
+theme('note_getter_exc', '!', 'cell note for an exception during computation')
+
+theme('color_note_pending', 'bold magenta', 'color of note of pending cells')
+theme('color_note_type', '226 green', 'cell note for numeric types in anytype columns')
+theme('color_format_exc', '48 bold yellow', 'color of formatting exception note')
+theme('color_getter_exc', 'red bold', 'color of computation exception note')
+theme('scroll_incr', 3, 'amount to scroll with scrollwheel')
 
 ENTER='^J'
 ESC='^['
+globalCommand('KEY_RESIZE', '', 'no-op by default')
+globalCommand('q',  'vd.sheets.pop(0)', 'quit current sheet')
 
-command('q',  'vd.sheets.pop(0)', 'quit the current sheet')
+globalCommand('KEY_LEFT',  'cursorRight(-1)', 'move one column left',  'move-left')
+globalCommand('KEY_DOWN',  'cursorDown(+1)',  'move one row down',     'move-down')
+globalCommand('KEY_UP',    'cursorDown(-1)',  'move one row up',       'move-up')
+globalCommand('KEY_RIGHT', 'cursorRight(+1)', 'move one column right', 'move-right')
+globalCommand('KEY_NPAGE', 'cursorDown(nVisibleRows); sheet.topRowIndex += nVisibleRows',  'move one page forward',  'move-page-down')
+globalCommand('KEY_PPAGE', 'cursorDown(-nVisibleRows); sheet.topRowIndex -= nVisibleRows', 'move one page backward', 'move-page-up')
 
-command(['h', 'KEY_LEFT'],  'cursorRight(-1)', 'go one column left')
-command(['j', 'KEY_DOWN'],  'cursorDown(+1)', 'go one row down')
-command(['k', 'KEY_UP'],    'cursorDown(-1)', 'go one row up')
-command(['l', 'KEY_RIGHT'], 'cursorRight(+1)', 'go one column right')
-command(['^F', 'KEY_NPAGE', 'kDOWN'], 'cursorDown(nVisibleRows); sheet.topRowIndex += nVisibleRows', 'scroll one page down')
-command(['^B', 'KEY_PPAGE', 'kUP'], 'cursorDown(-nVisibleRows); sheet.topRowIndex -= nVisibleRows', 'scroll one page up')
+globalCommand('gq', 'vd.sheets.clear()', 'quit all sheets (clean exit)', 'quit-all')
 
-command('gq', 'vd.sheets.clear()', 'drop all sheets (clean exit)')
+globalCommand('gh', 'sheet.cursorVisibleColIndex = sheet.leftVisibleColIndex = 0', 'move all the way to the left', 'move-far-left')
+globalCommand('KEY_HOME', 'sheet.cursorRowIndex = sheet.topRowIndex = 0', 'move all the way to the top', 'move-top')
+globalCommand('KEY_END', 'sheet.cursorRowIndex = len(rows); sheet.topRowIndex = cursorRowIndex-nVisibleRows', 'move all the way to the bottom', 'move-bottom')
+globalCommand('gl', 'sheet.leftVisibleColIndex = len(visibleCols)-1; pageLeft(); sheet.cursorVisibleColIndex = len(visibleCols)-1', 'move all the way to the right', 'move-far-right')
 
-command('gh', 'sheet.cursorVisibleColIndex = sheet.leftVisibleColIndex = nKeys', 'go to leftmost non-key column')
-command('gk', 'sheet.cursorRowIndex = sheet.topRowIndex = 0', 'go to top row')
-command('gj', 'sheet.cursorRowIndex = len(rows); sheet.topRowIndex = cursorRowIndex-nVisibleRows', 'go to bottom row')
-command('gl', 'sheet.cursorVisibleColIndex = len(visibleCols)-1', 'go to rightmost column')
+globalCommand('h', 'move-left')
+globalCommand('j', 'move-down')
+globalCommand('k', 'move-up')
+globalCommand('l', 'move-right')
+globalCommand('gKEY_LEFT', 'move-far-left')
+globalCommand('gKEY_RIGHT', 'move-far-right')
+globalCommand('gKEY_UP', 'move-top')
+globalCommand('gKEY_DOWN', 'move-bottom')
+globalCommand(['^F', 'kDOWN'], 'move-page-down')
+globalCommand(['^B', 'kUP'], 'move-page-up')
+globalCommand(['gg', 'gk'], 'move-top')
+globalCommand(['G', 'gj'], 'move-bottom')
+globalCommand('BUTTON1_PRESSED', 'sheet.cursorRowIndex=topRowIndex+mouseY-1', 'move-mouse-row')
+globalCommand('BUTTON1_RELEASED', 'sheet.topRowIndex=cursorRowIndex-mouseY+1', 'scroll-mouse-row')
+globalCommand('BUTTON4_PRESSED', 'cursorDown(options.scroll_incr); sheet.topRowIndex += options.scroll_incr', 'move scroll_incr forward', 'scroll-up')
+globalCommand('REPORT_MOUSE_POSITION', 'cursorDown(-options.scroll_incr); sheet.topRowIndex -= options.scroll_incr', 'move scroll_incr backward', 'scroll-down')
 
-alias('gg', 'gk')
-alias('G', 'gj')
-alias('KEY_HOME', 'gk')
-alias('KEY_END', 'gj')
+globalCommand('^L', 'vd.scr.clear()', 'refresh screen')
+globalCommand('^G', 'status(statusLine)', 'show cursor position and bounds of current sheet on status line')
+globalCommand('^V', 'status(__version__)', 'show version information on status line')
+globalCommand('^P', 'vd.push(TextSheet("statusHistory", vd.statusHistory, rowtype="statuses"))', 'open Status History')
 
-command('^L', 'vd.scr.clear()', 'redraw entire terminal screen')
-command('^G', 'status(statusLine)', 'show info for the current sheet')
-command('^V', 'status(__version__)', 'show version information')
+globalCommand('<', 'moveToNextRow(lambda row,sheet=sheet,col=cursorCol,val=cursorValue: col.getValue(row) != val, reverse=True) or status("no different value up this column")', 'move up the current column to the next value')
+globalCommand('>', 'moveToNextRow(lambda row,sheet=sheet,col=cursorCol,val=cursorValue: col.getValue(row) != val) or status("no different value down this column")', 'move down the current column to the next value')
+globalCommand('{', 'moveToNextRow(lambda row,sheet=sheet: sheet.isSelected(row), reverse=True) or status("no previous selected row")', 'move up the current column to the next selected row')
+globalCommand('}', 'moveToNextRow(lambda row,sheet=sheet: sheet.isSelected(row)) or status("no next selected row")', 'move down the current column to the next selected row')
 
-command('<', 'moveToNextRow(lambda row,sheet=sheet,col=cursorCol,val=cursorValue: col.getValue(row) != val, reverse=True) or status("no different value up this column")', 'move up to previous value in this column')
-command('>', 'moveToNextRow(lambda row,sheet=sheet,col=cursorCol,val=cursorValue: col.getValue(row) != val) or status("no different value down this column")', 'move down to next value in this column')
-command('{', 'moveToNextRow(lambda row,sheet=sheet: sheet.isSelected(row), reverse=True) or status("no previous selected row")', 'move to previous selected row')
-command('}', 'moveToNextRow(lambda row,sheet=sheet: sheet.isSelected(row)) or status("no next selected row")', 'move to next selected row')
+globalCommand('_', 'cursorCol.toggleWidth(cursorCol.getMaxWidth(visibleRows))', 'adjust width of current column', 'width-curcol-max')
+globalCommand('z_', 'cursorCol.width = int(input("set width= ", value=cursorCol.width))', 'adjust current column width to given number', 'width-curcol-input')
 
-command('_', 'cursorCol.toggleWidth(cursorCol.getMaxWidth(visibleRows))', 'toggle this column width between default_width and to fit visible values')
-command('-', 'cursorCol.width = 0', 'hide this column')
+globalCommand('-', 'cursorCol.width = 0', 'hide current column', 'width-curcol-zero')
+globalCommand('z-', 'cursorCol.width = cursorCol.width//2', 'reduce width of current column by half', 'width-curcol-half')
+globalCommand('!', 'toggleKeyColumn(cursorColIndex); cursorRight(+1)', 'pin current column on the left as a key column', 'toggle-curcol-key')
+globalCommand('z~', 'cursorCol.type = anytype', 'set type of current column to anytype', 'type-curcol-any')
+globalCommand('~', 'cursorCol.type = str', 'set type of current column to str', 'type-curcol-str')
+globalCommand('@', 'cursorCol.type = date', 'set type of current column to date', 'type-curcol-date')
+globalCommand('#', 'cursorCol.type = int', 'set type of current column to int', 'type-curcol-int')
+globalCommand('$', 'cursorCol.type = currency', 'set type of current column to currency', 'type-curcol-currency')
+globalCommand('%', 'cursorCol.type = float', 'set type of current column to float', 'type-curcol-float')
+globalCommand('^', 'cursorCol.name = editCell(cursorVisibleColIndex, -1)', 'edit name of current column', 'edit-curcol-name')
 
-command('g_', 'for c in visibleCols: c.width = c.getMaxWidth(visibleRows)', 'set width of all columns to fit visible cells')
+globalCommand('g_', 'for c in visibleCols: c.width = c.getMaxWidth(visibleRows)', 'adjust width of all visible columns', 'width-cols-max')
 
-command('[', 'rows.sort(key=lambda r,col=cursorCol: col.getValue(r))', 'sort by this column ascending')
-command(']', 'rows.sort(key=lambda r,col=cursorCol: col.getValue(r), reverse=True)', 'sort by this column descending')
+globalCommand('[', 'orderBy(cursorCol)', 'sort ascending by current column', 'sort-curcol-asc')
+globalCommand(']', 'orderBy(cursorCol, reverse=True)', 'sort descending by current column', 'sort-curcol-desc')
+globalCommand('g[', 'orderBy(*keyCols)', 'sort ascending by all key columns', 'sort-keycols-asc')
+globalCommand('g]', 'orderBy(*keyCols, reverse=True)', 'sort descending by all key columns', 'sort-keycols-desc')
 
-command('^D', 'options.debug = not options.debug; status("debug " + ("ON" if options.debug else "OFF"))', 'toggle debug mode')
+globalCommand('^E', 'vd.lastErrors and vd.push(TextSheet("last_error", vd.lastErrors[-1])) or status("no error")', 'view traceback for most recent error')
+globalCommand('z^E', 'vd.push(TextSheet("cell_error", getattr(cursorCell, "error", None) or error("no error this cell")))', 'view traceback for error in current cell')
 
-command('^E', 'vd.lastErrors and vd.push(TextSheet("last_error", vd.lastErrors[-1])) or status("no error")', 'open stack trace for most recent error')
 
-command('^^', 'vd.sheets[0], vd.sheets[1] = vd.sheets[1], vd.sheets[0]', 'jump to previous sheet')
+globalCommand('^^', 'vd.sheets[0], vd.sheets[1] = vd.sheets[1], vd.sheets[0]', 'jump to previous sheet (swaps with current sheet)')
 
-command('g^E', 'vd.push(TextSheet("last_errors", "\\n\\n".join(vd.lastErrors)))', 'open most recent errors')
+globalCommand('g^E', 'vd.push(TextSheet("last_errors", sum(vd.lastErrors[-10:], [])))', 'view traceback for most recent errors')
 
-command('^R', 'reload(); recalc(); status("reloaded")', 'reload sheet from source')
+globalCommand('^R', 'reload(); recalc(); status("reloaded")', 'reload current sheet')
+globalCommand('z^R', 'cursorCol._cachedValues.clear()', 'clear cache for current column')
 
-command('/', 'moveRegex(regex=input("/", type="regex"), columns="cursorCol", backward=False)', 'search this column forward for regex')
-command('?', 'moveRegex(regex=input("?", type="regex"), columns="cursorCol", backward=True)', 'search this column backward for regex')
-command('n', 'moveRegex(reverse=False)', 'go to next match')
-command('p', 'moveRegex(reverse=True)', 'go to previous match')
+globalCommand('/', 'moveRegex(sheet, regex=input("/", type="regex"), columns="cursorCol", backward=False)', 'search for regex forwards in current column')
+globalCommand('?', 'moveRegex(sheet, regex=input("?", type="regex"), columns="cursorCol", backward=True)', 'search for regex backwards in current column')
+globalCommand('n', 'moveRegex(sheet, reverse=False)', 'move to next match from last search')
+globalCommand('N', 'moveRegex(sheet, reverse=True)', 'move to previous match from last search')
 
-command('g/', 'moveRegex(regex=input("g/", type="regex"), backward=False, columns="visibleCols")', 'search regex forward in all visible columns')
-command('g?', 'moveRegex(regex=input("g?", type="regex"), backward=True, columns="visibleCols")', 'search regex backward in all visible columns')
+globalCommand('g/', 'moveRegex(sheet, regex=input("g/", type="regex"), backward=False, columns="visibleCols")', 'search for regex forwards over all visible columns')
+globalCommand('g?', 'moveRegex(sheet, regex=input("g?", type="regex"), backward=True, columns="visibleCols")', 'search for regex backwards over all visible columns')
 
-command('e', 'cursorCol.setValues([cursorRow], editCell(cursorVisibleColIndex)); sheet.cursorRowIndex += 1', 'edit this cell')
-command('ge', 'cursorCol.setValues(selectedRows, input("set selected to: ", value=cursorValue))', 'edit this column for all selected rows')
+globalCommand('e', 'cursorCol.setValues([cursorRow], editCell(cursorVisibleColIndex)); sheet.exec_keystrokes(options.cmd_after_edit)', 'edit contents of current cell')
+globalCommand('ge', 'cursorCol.setValues(selectedRows or rows, input("set selected to: ", value=cursorValue))', 'set contents of current column for selected rows to input')
+globalCommand('zd', 'cursorCol.setValues([cursorRow], None)', 'set contents of current cell to None', 'set-curcell-none')
+globalCommand('gzd', 'cursorCol.setValues(selectedRows, None)', 'set contents of cells in current column to None for selected rows', 'set-selected-curcol-none')
+globalCommand('KEY_DC', 'set-curcell-none')
+globalCommand('gKEY_DC', 'set-selected-curcol-none')
 
-command('d', 'rows.pop(cursorRowIndex)', 'delete this row')
-command('gd', 'deleteSelected()', 'delete all selected rows')
+globalCommand('t', 'toggle([cursorRow]); cursorDown(1)', 'toggle selection of current row')
+globalCommand('s', 'select([cursorRow]); cursorDown(1)', 'select current row')
+globalCommand('u', 'unselect([cursorRow]); cursorDown(1)', 'unselect current row')
 
-command(' ', 'toggle([cursorRow]); cursorDown(1)', 'toggle select of this row')
-command('s', 'select([cursorRow]); cursorDown(1)', 'select this row')
-command('u', 'unselect([cursorRow]); cursorDown(1)', 'unselect this row')
+globalCommand('|', 'selectByIdx(vd.searchRegex(sheet, regex=input("|", type="regex"), columns="cursorCol"))', 'select rows matching regex in current column')
+globalCommand('\\', 'unselectByIdx(vd.searchRegex(sheet, regex=input("\\\\", type="regex"), columns="cursorCol"))', 'unselect rows matching regex in current column')
 
-command('|', 'selectByIdx(searchRegex(regex=input("|", type="regex"), columns="cursorCol"))', 'select rows by regex matching this columns')
-command('\\', 'unselectByIdx(searchRegex(regex=input("\\\\", type="regex"), columns="cursorCol"))', 'unselect rows by regex matching this columns')
+globalCommand('gt', 'toggle(rows)', 'toggle selection of all rows')
+globalCommand('gs', 'select(rows)', 'select all rows')
+globalCommand('gu', '_selectedRows.clear()', 'unselect all rows')
 
-command('g ', 'toggle(rows)', 'toggle select of all rows')
-command('gs', 'select(rows)', 'select all rows')
-command('gu', '_selectedRows.clear()', 'unselect all rows')
+globalCommand('g|', 'selectByIdx(vd.searchRegex(sheet, regex=input("g|", type="regex"), columns="visibleCols"))', 'select rows matching regex in any visible column')
+globalCommand('g\\', 'unselectByIdx(vd.searchRegex(sheet, regex=input("g\\\\", type="regex"), columns="visibleCols"))', 'unselect rows matching regex in any visible column')
 
-command('g|', 'selectByIdx(searchRegex(regex=input("g|", type="regex"), columns="visibleCols"))', 'select rows by regex matching any visible column')
-command('g\\', 'unselectByIdx(searchRegex(regex=input("g\\\\", type="regex"), columns="visibleCols"))', 'unselect rows by regex matching any visible column')
+globalCommand(',', 'select(gatherBy(lambda r,c=cursorCol,v=cursorValue: c.getValue(r) == v), progress=False)', 'select rows matching current cell in current column')
+globalCommand('g,', 'select(gatherBy(lambda r,v=cursorRow: r == v), progress=False)', 'select rows matching current cell in all visible columns')
 
-command(',', 'select(gatherBy(lambda r,c=cursorCol,v=cursorValue: c.getValue(r) == v), progress=False)', 'select rows matching by this column')
-command('g,', 'select(gatherBy(lambda r,v=cursorRow: r == v), progress=False)', 'select all rows that match this row')
+globalCommand('"', 'vs = copy(sheet); vs.name += "_selectedref"; vs.rows = list(selectedRows or rows); vs.select(selectedRows); vd.push(vs)', 'open duplicate sheet with only selected rows')
+globalCommand('g"', 'vs = copy(sheet); vs.name += "_copy"; vs.rows = list(rows); vs.select(selectedRows); vd.push(vs)', 'open duplicate sheet with all rows')
+globalCommand('gz"', 'vs = deepcopy(sheet); vs.name += "_selectedcopy"; vs.rows = async_deepcopy(vs, selectedRows or rows); vd.push(vs); status("pushed sheet with async deepcopy of all rows")', 'open duplicate sheet with deepcopy of selected rows')
 
-command('"', 'vd.push(sheet.copy("_selected")).rows = list(sheet.selectedRows)', 'push duplicate sheet with only selected rows')
-command('g"', 'vd.push(sheet.copy())', 'push duplicate sheet')
-command('V', 'vd.push(TextSheet("%s[%s].%s" % (name, cursorRowIndex, cursorCol.name), cursorValue))', 'view readonly contents of this cell in a new sheet')
+globalCommand('=', 'addColumn(ColumnExpr(inputExpr("new column expr=")), index=cursorColIndex+1)', 'create new column from Python expression, with column names as variables')
+globalCommand('g=', 'cursorCol.setValuesFromExpr(selectedRows or rows, inputExpr("set selected="))', 'set current column for selected rows to result of Python expression')
 
-command('`', 'vd.push(source if isinstance(source, Sheet) else None)', 'push source sheet')
-command('S', 'vd.push(SheetsSheet())', 'open Sheet stack')
-command('C', 'vd.push(ColumnsSheet(sheet))', 'open Columns for this sheet')
-command('O', 'vd.push(vd.optionsSheet)', 'open Options for this sheet')
-command('z?', 'vd.push(HelpSheet(name + "_commands", sheet))', 'open command help sheet')
-alias('KEY_F(1)', 'z?')
+globalCommand('V', 'vd.push(TextSheet("%s[%s].%s" % (name, cursorRowIndex, cursorCol.name), cursorDisplay.splitlines()))', 'view contents of current cell in a new sheet')
+
+globalCommand('S', 'vd.push(SheetsSheet("sheets"))', 'open Sheets Sheet')
+globalCommand('C', 'vd.push(ColumnsSheet(sheet.name+"_columns", source=sheet))', 'open Columns Sheet')
+globalCommand('gC', 'vd.push(ColumnsSheet("all_columns", source=vd.sheets))', 'open Columns Sheet with all columns from all sheets')
+globalCommand('O', 'vd.push(vd.optionsSheet)', 'open Options')
+globalCommand(['KEY_F(1)', 'z?'], 'vd.push(HelpSheet(name + "_commands", source=sheet))', 'view VisiData man page', 'help-commands')
+globalCommand('^Z', 'suspend()', 'suspend VisiData process')
 
 
 # VisiData uses Python native int, float, str, and adds simple date, currency, and anytype.
 #
 # A type T is used internally in these ways:
-#    o = T(str)   # for conversion from string
+#    o = T(val)   # for interpreting raw value
+#    o = T(str)   # for conversion from string (when setting)
 #    o = T()      # for default value to be used when conversion fails
 #
 # The resulting object o must be orderable and convertible to a string for display and certain outputs (like csv).
 
-## minimalist 'any' type
-def anytype(r=''):
-    return str(r)
+def anytype(r=None):
+    'minimalist "any" type'
+    return r
 anytype.__name__ = ''
 
-option('float_chars', '+-0123456789.eE_', 'valid numeric characters')
-def currency(s):
-    'a `float` with any leading and trailing non-numeric characters stripped'
-    floatchars = options.float_chars
+floatchars='+-0123456789.eE'
+def currency(s=''):
+    'dirty float (strip non-numeric characters)'
     if isinstance(s, str):
-        while s[0] not in floatchars:
-            s = s[1:]
-        while s[-1] not in floatchars:
-            s = s[:-1]
-    return float(s)
+        s = ''.join(ch for ch in s if ch in floatchars)
+    return float(s) if s else float()
 
+@functools.total_ordering
 class date:
-    '`datetime` wrapper, constructing from time_t or from str with dateutil.parse'
+    'datetime wrapper, constructed from time_t or from str with dateutil.parse'
 
     def __init__(self, s=None):
         if s is None:
@@ -264,14 +334,16 @@ class date:
         elif isinstance(s, str):
             import dateutil.parser
             self.dt = dateutil.parser.parse(s)
+        elif isinstance(s, date):
+            self.dt = s.dt
         else:
-            assert isinstance(s, datetime.datetime)
+            assert isinstance(s, datetime.datetime), (type(s), s)
             self.dt = s
 
     def to_string(self, fmtstr=None):
-        'Convert datetime object to string, in ISO 8601 format by default.'
+        'Convert datetime object to string, using options.disp_date_fmt.'
         if not fmtstr:
-            fmtstr = '%Y-%m-%d %H:%M:%S'
+            fmtstr = options.disp_date_fmt
         return self.dt.strftime(fmtstr)
 
     def __getattr__(self, k):
@@ -280,31 +352,45 @@ class date:
 
     def __str__(self):
         return self.to_string()
-
+    def __hash__(self):
+        return hash(self.dt)
+    def __float__(self):
+        return self.dt.timestamp()
     def __lt__(self, a):
         return self.dt < a.dt
-
+    def __eq__(self, a):
+        return self.dt == a.dt
+    def __sub__(self, a):
+        return (self.dt - a.dt).days
+    def __add__(self, a):
+        return date(self.dt + a)
 
 typemap = {
-    str: '~',
+    None: 'Ø',
+    str: '',
     date: '@',
     int: '#',
+    len: '#',
     currency: '$',
     float: '%',
-    anytype: ' ',
+    anytype: '',
 }
 
 def joinSheetnames(*sheetnames):
-    'Concatenate sheet names using `options.sheetname_joiner`.'
-    return options.sheetname_joiner.join(str(x) for x in sheetnames)
+    'Concatenate sheet names in a standard way'
+    return '_'.join(str(x) for x in sheetnames)
 
 def error(s):
-    'Return custom exception as function, for use with `lambda` and `eval`.'
-    raise Exception(s)
+    'Raise an expection.'
+    status(s)
+    raise ExpectedException(s)
 
 def status(*args):
     'Return status property via function call.'
     return vd().status(*args)
+
+def input(*args, **kwargs):
+    return vd().input(*args, **kwargs)
 
 def moveListItem(L, fromidx, toidx):
     "Move element within list `L` and return element's new index."
@@ -322,35 +408,41 @@ def enumPivot(L, pivotIdx):
     for i in itertools.chain(rng, rng2):
         yield i, L[i]
 
+def clean_to_id(s):  # [Nas Banov] https://stackoverflow.com/a/3305731
+    return re.sub(r'\W|^(?=\d)', '_', str(s))
 
-# VisiData singleton contains all sheets
+
 @functools.lru_cache()
 def vd():
-    '''Instantiate and return singleton instance of VisiData class.
-
-    Contains all sheets, and (as singleton) is unique instance..'''
+    'Return VisiData singleton, which contains all global context'
     return VisiData()
 
-def exceptionCaught(status=True):
-    return vd().exceptionCaught(status)
+def exceptionCaught(e, **kwargs):
+    return vd().exceptionCaught(e, **kwargs)
+
+def stacktrace():
+    return traceback.format_exc().strip().splitlines()
 
 def chooseOne(choices):
-    '''Return `input` statement choices formatted with `/` as separator.
+    'Return one of `choices` elements (if list) or values (if dict).'
+    def choiceCompleter(v, i):
+        opts = [x for x in choices if x.startswith(v)]
+        return opts[i%len(opts)]
 
-    Choices can be list/tuple or dict (if dict, its keys will be used).'''
     if isinstance(choices, dict):
-        return choices[input('/'.join(choices.keys()) + ': ')]
+        return choices[input('/'.join(choices.keys()) + ': ', completer=choiceCompleter)]
     else:
-        return input('/'.join(str(x) for x in choices) + ': ')
+        return input('/'.join(str(x) for x in choices) + ': ', completer=choiceCompleter)
 
 def regex_flags():
     'Return flags to pass to regex functions from options'
     return sum(getattr(re, f.upper()) for f in options.regex_flags)
 
-def sync():
-    'Wait for all async threads to finish.'
-    while len(vd().unfinishedThreads) > 0:
-        vd().checkForFinishedThreads()
+def moveRegex(sheet, *args, **kwargs):
+    list(vd().searchRegex(sheet, *args, moveCursor=True, **kwargs))
+
+def sync(expectedThreads=0):
+    vd().sync(expectedThreads)
 
 def asyncthread(func):
     'Function decorator, to make calls to `func()` spawn a separate thread if available.'
@@ -358,8 +450,44 @@ def asyncthread(func):
         return vd().execAsync(func, *args, **kwargs)
     return _execAsync
 
+class Progress:
+    def __init__(self, iterable=None, total=None, sheet=None):
+        self.iterable = iterable
+        self.total = total if total is not None else len(iterable)
+        self.sheet = sheet if sheet else getattr(threading.current_thread(), 'sheet', None)
+        self.made = 0
+
+    def __enter__(self):
+        if self.sheet:
+            self.sheet.progresses.append(self)
+        return self
+
+    def addProgress(self, n):
+        self.made += n
+
+    def __exit__(self, exc_type, exc_val, tb):
+        if self.sheet:
+            self.sheet.progresses.remove(self)
+
+    def __iter__(self):
+        with self as prog:
+            for item in self.iterable:
+                yield item
+                self.made += 1
+
+@async
+def _async_deepcopy(vs, newlist, oldlist):
+    for r in Progress(oldlist):
+        newlist.append(deepcopy(r))
+
+def async_deepcopy(vs, rowlist):
+    ret = []
+    _async_deepcopy(vs, ret, rowlist)
+    return ret
+
+
 class VisiData:
-    allPrefixes = 'gz'  # 'g'lobal, 'z'scroll
+    allPrefixes = 'gz'  # embig'g'en, 'z'mallify
 
     def __init__(self):
         self.sheets = []
@@ -370,46 +498,49 @@ class VisiData:
         self.lastInputs = collections.defaultdict(collections.OrderedDict)  # [input_type] -> prevInputs
         self.keystrokes = ''
         self.inInput = False
+        self.prefixWaiting = False
         self.scr = None  # curses scr
-        self.hooks = {}
-        self.threads = []  # all threads, including finished
+        self.hooks = collections.defaultdict(list)  # [hookname] -> list(hooks)
+        self.threads = [] # all long-running threads, including main and finished
+        self.addThread(threading.current_thread(), endTime=0)
+        self.addHook('rstatus', lambda sheet,self=self: (self.keystrokes, 'white'))
+        self.addHook('rstatus', self.rightStatus)
 
     def status(self, *args):
         'Add status message to be shown until next action.'
         s = '; '.join(str(x) for x in args)
         self.statuses.append(s)
-        self.statusHistory.insert(0, s)
+        self.statusHistory.insert(0, args[0] if len(args) == 1 else args)
         return s
 
     def addHook(self, hookname, hookfunc):
         'Add hookfunc by hookname, to be called by corresponding `callHook`.'
-        if hookname in self.hooks:
-            hooklist = self.hooks[hookname]
-        else:
-            hooklist = []
-            self.hooks[hookname] = hooklist
-
-        hooklist.append(hookfunc)
+        self.hooks[hookname].insert(0, hookfunc)
 
     def callHook(self, hookname, *args, **kwargs):
         'Call all functions registered with `addHook` for the given hookname.'
-        r = None
-        for f in self.hooks.get(hookname, []):
-            r = r or f(*args, **kwargs)
+        r = []
+        for f in self.hooks[hookname]:
+            try:
+                r.append(f(*args, **kwargs))
+            except Exception as e:
+                exceptionCaught(e)
         return r
 
+    def addThread(self, t, endTime=None):
+        t.startTime = time.process_time()
+        t.endTime = endTime
+        t.status = ''
+        t.profile = None
+        self.threads.append(t)
+
     def execAsync(self, func, *args, **kwargs):
-        'Execute `func(*args, **kwargs)`, possibly in a separate thread.'
-        if threading.current_thread().daemon:
-            # Don't spawn a new thread from a subthread.
-            return func(*args, **kwargs)
+        'Execute `func(*args, **kwargs)` in a separate thread.'
 
         currentSheet = self.sheets[0]
-        if currentSheet.currentThread:
-            confirm('replace task %s already in progress? ' % currentSheet.currentThread.name)
         thread = threading.Thread(target=self.toplevelTryFunc, daemon=True, args=(func,)+args, kwargs=kwargs)
-        self.threads.append(thread)
-        currentSheet.currentThread = thread
+        self.addThread(thread)
+        currentSheet.currentThreads.append(thread)
         thread.sheet = currentSheet
         thread.start()
         return thread
@@ -418,9 +549,6 @@ class VisiData:
         'Thread entry-point for `func(*args, **kwargs)` with try/except wrapper'
         t = threading.current_thread()
         t.name = func.__name__
-        t.startTime = time.process_time()
-        t.endTime = None
-        t.status = ''
         ret = None
         try:
             ret = func(*args, **kwargs)
@@ -428,37 +556,64 @@ class VisiData:
             t.status += 'aborted by user'
             status('%s aborted' % t.name)
         except Exception as e:
-            t.status += status('%s: %s' % (type(e).__name__, ' '.join(str(x) for x in e.args)))
-            exceptionCaught()
+            exceptionCaught(e)
 
-        t.sheet.currentThread = None
-        t.sheet.progressMade = t.sheet.progressTotal
+        t.sheet.currentThreads.remove(t)
         return ret
 
     @property
     def unfinishedThreads(self):
         'A list of unfinished threads (those without a recorded `endTime`).'
-        return [t for t in self.threads if t.endTime is None]
+        return [t for t in self.threads if getattr(t, 'endTime', None) is None]
 
     def checkForFinishedThreads(self):
         'Mark terminated threads with endTime.'
         for t in self.unfinishedThreads:
             if not t.is_alive():
                 t.endTime = time.process_time()
-                t.status += 'ended'
+                if not getattr(t, 'status', None):
+                    t.status = 'ended'
+
+    def sync(self, expectedThreads=0):
+        'Wait for all but expectedThreads async threads to finish.'
+        while len(self.unfinishedThreads) > expectedThreads:
+            self.checkForFinishedThreads()
+
+    def refresh(self):
+        Sheet.visibleCols.fget.cache_clear()
 
     def editText(self, y, x, w, **kwargs):
         'Wrap global editText with `preedit` and `postedit` hooks.'
         v = self.callHook('preedit')
-        if v is not None:
-            return v
-        cursorEnable(True)
-        v = editText(self.scr, y, x, w, **kwargs)
-        cursorEnable(False)
+        if not v or v[0] is None:
+            with EnableCursor():
+                v = editText(self.scr, y, x, w, **kwargs)
+        else:
+            v = v[0]
+
         if kwargs.get('display', True):
             self.status('"%s"' % v)
             self.callHook('postedit', v)
         return v
+
+    def input(self, prompt, type='', **kwargs):
+        'Compose input prompt.'
+        if type:
+            ret = self._inputLine(prompt, history=list(self.lastInputs[type].keys()), **kwargs)
+            self.lastInputs[type][ret] = ret
+        else:
+            ret = self._inputLine(prompt, **kwargs)
+        return ret
+
+    def _inputLine(self, prompt, **kwargs):
+        'Add prompt to bottom of screen and get line of input from user.'
+        scr = self.scr
+        if scr:
+            scr.addstr(self.windowHeight-1, 0, prompt)
+        self.inInput = True
+        ret = self.editText(self.windowHeight-1, len(prompt), self.windowWidth-len(prompt)-8, attr=colors[options.color_edit_cell], unprintablechar=options.disp_unprintable, **kwargs)
+        self.inInput = False
+        return ret
 
     def getkeystroke(self, scr, vs=None):
         'Get keystroke and display it on status bar.'
@@ -466,7 +621,7 @@ class VisiData:
         try:
             k = scr.get_wch()
             self.drawRightStatus(scr, vs or self.sheets[0]) # continue to display progress %
-        except Exception:
+        except curses.error:
             return ''  # curses timeout
 
         if isinstance(k, str):
@@ -480,6 +635,7 @@ class VisiData:
     def searchRegex(self, sheet, moveCursor=False, reverse=False, **kwargs):
         'Set row index if moveCursor, otherwise return list of row indexes.'
         def findMatchingColumn(sheet, row, columns, func):
+            'Find column for which func matches the displayed value in this row'
             for c in columns:
                 if func(c.getDisplayValue(row)):
                     return c
@@ -515,32 +671,31 @@ class VisiData:
             rng2 = range(0, sheet.cursorRowIndex+1)
 
         matchingRowIndexes = 0
-        sheet.progressTotal = sheet.nRows
-        sheet.progressMade = 0
 
-        for r in itertools.chain(rng, rng2):
-            sheet.progressMade += 1
-            c = findMatchingColumn(sheet, sheet.rows[r], columns, regex.search)
-            if c:
-                if moveCursor:
-                    sheet.cursorRowIndex = r
-                    sheet.cursorVisibleColIndex = sheet.visibleCols.index(c)
-                    if r in rng2:
-                        status('search wrapped')
-                    return
-                else:
-                    matchingRowIndexes += 1
-                    yield r
+        with Progress(total=sheet.nRows) as prog:
+            for r in itertools.chain(rng, rng2):
+                prog.addProgress(1)
+                c = findMatchingColumn(sheet, sheet.rows[r], columns, regex.search)
+                if c:
+                    if moveCursor:
+                        sheet.cursorRowIndex = r
+                        sheet.cursorVisibleColIndex = sheet.visibleCols.index(c)
+                        if r in rng2:
+                            status('search wrapped')
+                        return
+                    else:
+                        matchingRowIndexes += 1
+                        yield r
 
         status('%s matches for /%s/' % (matchingRowIndexes, regex.pattern))
 
-    def exceptionCaught(self, status=True):
+    def exceptionCaught(self, exc=None, status=True):
         'Maintain list of most recent errors and return most recent one.'
-        import traceback
-        self.lastErrors.append(traceback.format_exc().strip())
-        self.lastErrors = self.lastErrors[-10:]  # keep most recent
+        if isinstance(exc, ExpectedException):  # already reported, don't log
+            return
+        self.lastErrors.append(stacktrace())
         if status:
-            return self.status(self.lastErrors[-1].splitlines()[-1])
+            return self.status(self.lastErrors[-1][-1])  # last line of latest error
         if options.debug:
             raise
 
@@ -551,16 +706,23 @@ class VisiData:
             attr = colors[options.color_status]
             _clipdraw(scr, self.windowHeight-1, 0, lstatus, attr, self.windowWidth)
         except Exception as e:
-            self.exceptionCaught()
+            self.exceptionCaught(e)
 
     def drawRightStatus(self, scr, vs):
         'Draw right side of status bar.'
-        try:
-            rstatus, attr = self.rightStatus(vs)
-            _clipdraw(scr, self.windowHeight-1, self.windowWidth-len(rstatus)-2, rstatus, attr, len(rstatus))
-            curses.doupdate()
-        except Exception as e:
-            self.exceptionCaught()
+        rightx = self.windowWidth-1
+        for rstatcolor in self.callHook('rstatus', vs):
+            if rstatcolor:
+                try:
+                    rstatus, color = rstatcolor
+                    rstatus = ' '+rstatus
+                    rightx -= len(rstatus)
+                    attr = colors[color]
+                    _clipdraw(scr, self.windowHeight-1, rightx, rstatus, attr, len(rstatus))
+                except Exception as e:
+                    self.exceptionCaught(e)
+
+        curses.doupdate()
 
     def leftStatus(self, vs):
         'Compose left side of status bar and add status messages.'
@@ -570,13 +732,11 @@ class VisiData:
 
     def rightStatus(self, sheet):
         'Compose right side of status bar.'
-        if sheet.progressMade == sheet.progressTotal:
-            pctLoaded = 'rows'
+        if sheet.currentThreads:
+            status = '%9d  %2d%%' % (len(sheet), sheet.progressPct)
         else:
-            pctLoaded = ' %2d%%' % sheet.progressPct
-        status = '%s %9d %s' % (self.keystrokes, sheet.nRows, pctLoaded)
-        attr = colors[options.color_status]
-        return status, attr
+            status = '%9d %s' % (len(sheet), sheet.rowtype)
+        return status, options.color_status
 
     @property
     def windowHeight(self):
@@ -590,7 +750,8 @@ class VisiData:
         'Manage execution of keystrokes and subsequent redrawing of screen.'
         global sheet
         scr.timeout(int(options.curses_timeout))
-        cursorEnable(False)
+        with suppress(curses.error):
+            curses.curs_set(0)
 
         self.scr = scr
 
@@ -601,21 +762,42 @@ class VisiData:
                 return
 
             sheet = self.sheets[0]
+            threading.current_thread().sheet = sheet
 
             try:
                 sheet.draw(scr)
             except Exception as e:
-                self.exceptionCaught()
+                self.exceptionCaught(e)
 
             self.drawLeftStatus(scr, sheet)
             self.drawRightStatus(scr, sheet)  # visible during this getkeystroke
 
             keystroke = self.getkeystroke(scr, sheet)
-            if keystroke:
-                if self.keystrokes not in self.allPrefixes:
+
+            if keystroke:  # wait until next keystroke to clear statuses and previous keystrokes
+                if not self.prefixWaiting:
                     self.keystrokes = ''
 
                 self.statuses = []
+
+                if keystroke == 'KEY_MOUSE':
+                    try:
+                        devid, x, y, z, bstate = curses.getmouse()
+                        if bstate & curses.BUTTON_CTRL:
+                            self.keystrokes += "CTRL-"
+                            bstate &= ~curses.BUTTON_CTRL
+                        if bstate & curses.BUTTON_ALT:
+                            self.keystrokes += "ALT-"
+                            bstate &= ~curses.BUTTON_ALT
+                        if bstate & curses.BUTTON_SHIFT:
+                            self.keystrokes += "SHIFT-"
+                            bstate &= ~curses.BUTTON_SHIFT
+
+                        keystroke = curses.mouseEvents.get(bstate, str(bstate))
+                        sheet.mouseX, sheet.mouseY = x, y
+                    except curses.error:
+                        keystroke = ''
+
                 self.keystrokes += keystroke
 
             self.drawRightStatus(scr, sheet)  # visible for commands that wait for input
@@ -623,25 +805,23 @@ class VisiData:
             if not keystroke:  # timeout instead of keypress
                 pass
             elif keystroke == '^Q':
-                return self.lastErrors and self.lastErrors[-1]
-            elif keystroke == 'KEY_RESIZE':
-                pass
-            elif keystroke == 'KEY_MOUSE':
-                try:
-                    devid, x, y, z, bstate = curses.getmouse()
-                    sheet.cursorRowIndex = sheet.topRowIndex+y-1
-                except curses.error:
-                    pass
-            elif self.keystrokes in sheet.commands:
-                sheet.exec_command(globals(), sheet.commands[self.keystrokes])
+                return self.lastErrors and '\n'.join(self.lastErrors[-1])
+            elif self.keystrokes in sheet._commands:
+                sheet.exec_keystrokes(self.keystrokes)
+                self.prefixWaiting = False
             elif keystroke in self.allPrefixes:
-                pass
+                self.keystrokes = ''.join(sorted(set(self.keystrokes)))  # prefix order/quantity does not matter
+                self.prefixWaiting = True
             else:
                 status('no command for "%s"' % (self.keystrokes))
+                self.prefixWaiting = False
 
             self.checkForFinishedThreads()
             self.callHook('predraw')
-            sheet.checkCursor()
+            try:
+                sheet.checkCursor()
+            except Exception as e:
+                exceptionCaught(e)
 
     def replace(self, vs):
         'Replace top sheet with the given sheet `vs`.'
@@ -661,40 +841,81 @@ class VisiData:
             if vs in self.sheets:
                 self.sheets.remove(vs)
                 self.sheets.insert(0, vs)
-            elif len(vs.rows) == 0:  # first time
+            elif vs.rows == tuple():  # empty tuple = first time sentinel
+                vs.rows = list(vs.rows)
                 self.sheets.insert(0, vs)
                 vs.reload()
+                vs.recalc()  # set up Columns
             else:
                 self.sheets.insert(0, vs)
             return vs
 # end VisiData class
 
 class LazyMap:
-    'A lazily evaluated mapping'
-    def __init__(self, keys, getter, setter):
-        self._keys = keys
-        self._getter = getter
-        self._setter = setter
+    'provides a lazy mapping to obj attributes.  useful when some attributes are expensive properties.'
+    def __init__(self, obj):
+        self.obj = obj
 
     def keys(self):
-        return self._keys
+        return dir(self.obj)
 
     def __getitem__(self, k):
-        if k not in self._keys:
+        if k not in dir(self.obj):
             raise KeyError(k)
-        return self._getter(k)
+        return getattr(self.obj, k)
 
     def __setitem__(self, k, v):
-        self._keys.append(k)
-        self._setter(k, v)
+        setattr(self.obj, k, v)
+
+class CompleteExpr:
+    def __init__(self, sheet=None):
+        self.sheet = sheet
+
+    def __call__(self, val, state):
+        i = len(val)-1
+        while val[i:].isidentifier() and i >= 0:
+            i -= 1
+
+        if i < 0:
+            base = ''
+            partial = val
+        elif val[i] == '.':  # no completion of attributes
+            return None
+        else:
+            base = val[:i+1]
+            partial = val[i+1:]
+
+        varnames = []
+        varnames.extend(sorted((base+col.name) for col in self.sheet.columns if col.name.startswith(partial)))
+        varnames.extend(sorted((base+x) for x in globals() if x.startswith(partial)))
+        return varnames[state%len(varnames)]
+
+
+class Colorizer:
+    def __init__(self, colorizerType, precedence, colorfunc):
+        self.type = colorizerType
+        self.precedence = precedence
+        self.func = colorfunc
 
 class Sheet:
-    'Base object for add-on inheritance.'
-    def __init__(self, name, *sources, columns=None):
-        self.name = name
-        self.sources = list(sources)
+    columns = []  # list of Column
+#    commands = []  # list of Command
+    colorizers = [ # list of Colorizer
+        Colorizer('hdr', 0, lambda s,c,r,v: options.color_default_hdr),
+        Colorizer('hdr', 9, lambda s,c,r,v: options.color_current_hdr if c is s.cursorCol else None),
+        Colorizer('hdr', 8, lambda s,c,r,v: options.color_key_col if c in s.keyCols else None),
+        Colorizer('col', 5, lambda s,c,r,v: options.color_current_col if c is s.cursorCol else None),
+        Colorizer('col', 7, lambda s,c,r,v: options.color_key_col if c in s.keyCols else None),
+        Colorizer('cell', 2, lambda s,c,r,v: options.color_default),
+        Colorizer('row', 8, lambda s,c,r,v: options.color_selected_row if s.isSelected(r) else None),
+    ]
+    nKeys = 0  # self.columns[:nKeys] are all pinned to the left and matched on join
+    rowtype = 'rows'
 
-        self.rows = []           # list of opaque row objects
+    def __init__(self, name, **kwargs):
+        self.name = name
+
+        self.rows = tuple()      # list of opaque row objects (tuple until first reload)
         self.cursorRowIndex = 0  # absolute index of cursor into self.rows
         self.cursorVisibleColIndex = 0  # index of cursor into self.visibleCols
 
@@ -707,35 +928,42 @@ class Sheet:
         self.rowLayout = {}      # [rowidx] -> y
         self.visibleColLayout = {}      # [vcolidx] -> (x, w)
 
-        # all columns in display order
-        self.columns = columns or []        # list of Column objects
-        self.nKeys = 0           # self.columns[:nKeys] are all pinned to the left and matched on join
+        # list of all columns in display order
+        self.columns = kwargs.get('columns') or [copy(c) for c in self.columns] or [Column('')]
+        self.recalc()
 
         # commands specific to this sheet
-        self.commands = collections.ChainMap(collections.OrderedDict(), baseCommands)
+        sheetcmds = collections.OrderedDict()
+        if hasattr(self, 'commands'):
+            for cmd in self.commands:
+                sheetcmds[cmd.name] = cmd
+        self._commands = collections.ChainMap(sheetcmds, baseCommands)
 
         self._selectedRows = {}  # id(row) -> row
 
         # for progress bar
-        self.progressMade = 0
-        self.progressTotal = 0
+        self.progresses = []  # list of Progress objects
 
-        # only allow one async task per sheet
-        self.currentThread = None
+        # track all async threads from sheet
+        self.currentThreads = []
 
-        self.colorizers = {'row': [], 'col': [], 'hdr': [], 'cell': []}
+        self._colorizers = {'row': [], 'col': [], 'hdr': [], 'cell': []}
 
-        self.addColorizer('hdr', 0, lambda s,c,r,v: options.color_default_hdr)
-        self.addColorizer('hdr', 9, lambda s,c,r,v: options.color_current_hdr if c is s.cursorCol else None)
-        self.addColorizer('hdr', 8, lambda s,c,r,v: options.color_key_col if c in s.keyCols else None)
-        self.addColorizer('col', 5, lambda s,c,r,v: options.color_current_col if c is s.cursorCol else None)
-        self.addColorizer('col', 7, lambda s,c,r,v: options.color_key_col if c in s.keyCols else None)
-        self.addColorizer('cell', 2, lambda s,c,r,v: options.color_default)
-        self.addColorizer('row', 8, lambda s,c,r,v: options.color_selected_row if s.isSelected(r) else None)
-        self.addColorizer('row', 10, lambda s,c,r,v: options.color_current_row if r is s.cursorRow else None)
+        for b in [self] + list(self.__class__.__bases__):
+            for c in getattr(b, 'colorizers', []):
+                self.addColorizer(c)
 
-    def addColorizer(self, colorizerType, precedence, colorfunc):
-        self.colorizers[colorizerType].append((precedence, colorfunc))
+        self.__dict__.update(kwargs)
+
+    def __bool__(self):
+        'an instantiated Sheet always tests true'
+        return True
+
+    def __len__(self):
+        return self.nRows
+
+    def addColorizer(self, c):
+        self._colorizers[c.type].append(c)
 
     def colorizeRow(self, row):
         return self.colorize(['row'], None, row)
@@ -755,10 +983,10 @@ class Sheet:
         attrpre = 0
 
         for colorizerType in colorizerTypes:
-            for precedence, func in sorted(self.colorizers[colorizerType], key=lambda x: x[0]):
-                color = func(self, col, row, value)
+            for colorizer in sorted(self._colorizers[colorizerType], key=lambda x: x.precedence):
+                color = colorizer.func(self, col, row, value)
                 if color:
-                    attr, attrpre = colors.update(attr, attrpre, color, precedence)
+                    attr, attrpre = colors.update(attr, attrpre, color, colorizer.precedence)
 
         return attr
 
@@ -766,66 +994,62 @@ class Sheet:
         'Compose left side of status bar for this sheet (overridable).'
         return options.disp_status_fmt.format(sheet=self)
 
-    def genProgress(self, L, total=None):
-        'Create generator (for for-loops), with `progressTotal` property.'
-        self.progressTotal = total or len(L)
-        self.progressMade = 0
-        for i in L:
-            self.progressMade += 1
-            yield i
+    def newRow(self):
+        return list((None for c in self.columns))
 
-        self.progressMade = self.progressTotal
+    def addRow(self, row, index=None):
+        if index is None:
+            self.rows.append(row)
+        else:
+            self.rows.insert(index, row)
+        return row
 
-    def command(self, keystrokes, execstr, helpstr):
-        'Populate command, help-string and execution string for keystrokes.'
-        if isinstance(keystrokes, str):
-            keystrokes = [keystrokes]
-
-        for ks in keystrokes:
-            self.commands[ks] = (ks, helpstr, execstr)
-
-    def moveRegex(self, *args, **kwargs):
-        'Wrap `VisiData.searchRegex`, with cursor additionally moved.'
-        list(self.searchRegex(*args, moveCursor=True, **kwargs))
-
-    def searchRegex(self, *args, **kwargs):
-        'Wrap `VisiData.searchRegex`.'
-        return self.vd.searchRegex(self, *args, **kwargs)
-
-    def searchColumnNameRegex(self, colregex):
+    def searchColumnNameRegex(self, colregex, moveCursor=False):
         'Select visible column matching `colregex`, if found.'
         for i, c in enumPivot(self.visibleCols, self.cursorVisibleColIndex):
             if re.search(colregex, c.name, regex_flags()):
-                self.cursorVisibleColIndex = i
-                return
+                if moveCursor:
+                    self.cursorVisibleColIndex = i
+                return c
 
     def recalc(self):
         for c in self.columns:
             if c._cachedValues:
                 c._cachedValues.clear()
+            c.sheet = self
+            c.name = c._name
 
     def reload(self):
-        'Default reloader, wrapping `loader` member function.'
+        'Default reloader wraps provided `loader` function'
         if self.loader:
             self.loader()
         else:
             status('no reloader')
 
-    def copy(self, suffix="'"):
-        '''Return copy of this sheet, with `suffix` appended to `name`, and a deepcopy of `columns`,
-         so their display attributes (width, etc) may be adjusted independently.'''
-        c = copy.copy(self)
-        c.name += suffix
-        c.topRowIndex = c.cursorRowIndex = 0
-        c.columns = copy.deepcopy(self.columns)
-        c._selectedRows = self._selectedRows.copy()
-        c.colorizers = self.colorizers.copy()
-        return c
+    def __copy__(self):
+        'copy sheet design (no rows).  deepcopy columns so their attributes (width, type, name) may be adjusted independently.'
+        cls = self.__class__
+        ret = cls.__new__(cls)
+        ret.__dict__.update(self.__dict__)
+        ret.rows = []                     # a fresh list without incurring any overhead
+        ret.columns = deepcopy(self.columns) # deepcopy columns even for shallow copy of sheet
+        ret.recalc()  # set .sheet on columns
+        ret._selectedRows = {}
+        ret.topRowIndex = ret.cursorRowIndex = 0
+        ret.progresses = []
+        ret.currentThreads = []
+        return ret
+
+    def __deepcopy__(self, memo):
+        'same as Sheet.__copy__'
+        ret = self.__copy__()
+        memo[id(self)] = ret
+        return ret
 
     @asyncthread
     def deleteSelected(self):
         'Delete all selected rows.'
-        oldrows = self.rows
+        oldrows = copy(self.rows)
         oldidx = self.cursorRowIndex
         ndeleted = 0
 
@@ -836,8 +1060,8 @@ class Sheet:
                 break
             oldidx += 1
 
-        self.rows = []
-        for r in self.genProgress(oldrows):
+        self.rows.clear()
+        for r in Progress(oldrows):
             if not self.isSelected(r):
                 self.rows.append(r)
                 if r is row:
@@ -854,154 +1078,180 @@ class Sheet:
     def __repr__(self):
         return self.name
 
-    def exec_command(self, vdglobals, cmd):
-        'Wrap execution of `cmd`, adding globals and `locs` dictionary.'
+    def evalexpr(self, expr, row):
+        return eval(expr, getGlobals(), LazyMapRow(self, row))
+
+    def inputExpr(self, prompt, *args, **kwargs):
+        return input(prompt, "expr", *args, completer=CompleteExpr(self), **kwargs)
+
+    def getCommand(self, keystrokes, default=None):
+        k = keystrokes
+        cmd = None
+        while k in self._commands:
+            cmd = self._commands.get(k, default)
+            k = cmd.execstr  # see if execstr is actually just an alias for another keystroke
+        return cmd
+
+    def exec_keystrokes(self, keystrokes, vdglobals=None):  # handle multiple commands concatenated?
+        return self.exec_command(self.getCommand(keystrokes), vdglobals, keystrokes=keystrokes)
+
+    def exec_command(self, cmd, args='', vdglobals=None, keystrokes=None):
+        "Execute `cmd` tuple with `vdglobals` as globals and this sheet's attributes as locals.  Returns True if user cancelled."
         escaped = False
+        err = ''
 
         if vdglobals is None:
-            vdglobals = globals()
-        # handy globals for use by commands
-        keystrokes, _, execstr = cmd
-        self.sheet = self
-        locs = LazyMap(dir(self),
-                lambda k,s=self: getattr(s, k),
-                lambda k,v,s=self: setattr(s, k, v)
-                )
+            vdglobals = getGlobals()
 
-        self.vd.callHook('preexec', self, keystrokes)
+        self.sheet = self
 
         try:
-            exec(execstr, vdglobals, locs)
+            self.vd.callHook('preexec', self, cmd.name if options.cmdlog_longname else keystrokes)
+            exec(cmd.execstr, vdglobals, LazyMap(self))
         except EscapeException as e:  # user aborted
-            self.vd.status(e.args[0])
+            self.vd.status('aborted')
             escaped = True
+        except Exception as e:
+            err = self.vd.exceptionCaught(e)
+
+        try:
+            self.vd.callHook('postexec', self.vd.sheets[0] if self.vd.sheets else None, escaped, err)
         except Exception:
-            self.vd.exceptionCaught()
+            self.vd.exceptionCaught(e)
 
-        self.vd.callHook('postexec', self.vd.sheets[0] if self.vd.sheets else None, escaped)
-
+        self.vd.refresh()
         return escaped
 
     @property
     def name(self):
-        'Wrap return of `_name`.'
-        return self._name
+        return self._name or ''
 
     @name.setter
     def name(self, name):
-        'Wrap setting of `_name`.'
-        self._name = name.replace(' ', '_')
+        'Set name without spaces.'
+        self._name = name.strip().replace(' ', '_')
 
     @property
-    def source(self):
-        'Return first source, if any.'
-        if not self.sources:
-            return None
-        else:
-#            assert len(self.sources) == 1, len(self.sources)
-            return self.sources[0]
+    def progressMade(self):
+        return sum(prog.made for prog in self.progresses)
+
+    @property
+    def progressTotal(self):
+        return sum(prog.total for prog in self.progresses)
 
     @property
     def progressPct(self):
-        'Return percentage of rows completed.'
+        'Percent complete as indicated by async actions.'
         if self.progressTotal != 0:
             return int(self.progressMade*100/self.progressTotal)
+        return 0
 
     @property
     def nVisibleRows(self):
-        'Return number of visible rows, calculable from window height.'
+        'Number of visible rows at the current window height.'
         return self.vd.windowHeight-2
 
     @property
     def cursorCol(self):
-        'Return current Column object.'
+        'Current Column object.'
         return self.visibleCols[self.cursorVisibleColIndex]
 
     @property
     def cursorRow(self):
-        'Return current row.'
+        'The row object at the row cursor.'
         return self.rows[self.cursorRowIndex]
 
     @property
     def visibleRows(self):  # onscreen rows
-        'Return a list of rows currently visible onscreen.'
+        'List of rows onscreen. '
         return self.rows[self.topRowIndex:self.topRowIndex+self.nVisibleRows]
 
     @property
+    @functools.lru_cache()
     def visibleCols(self):  # non-hidden cols
-        'Return a list of unhidden Column objects.'
+        'List of `Column` which are not hidden.'
         return [c for c in self.columns if not c.hidden]
 
     @property
-    def visibleColNames(self):
-        'Return string of visible column-names.'
-        return ' '.join(c.name for c in self.visibleCols)
-
-    @property
     def cursorColIndex(self):
-        'Return index of current column into Sheet.columns.'
+        'Index of current column into `columns`. Linear search; prefer `cursorCol` or `cursorVisibleColIndex`.'
         return self.columns.index(self.cursorCol)
 
     @property
     def keyCols(self):
-        'Return list of key columns.'
+        'List of the key columns (the first `nKeys` columns).'
         return self.columns[:self.nKeys]
 
     @property
     def nonKeyVisibleCols(self):
-        'Return list of unhidden non-key columns.'
+        'All columns which are not keysList of unhidden non-key columns.'
         return [c for c in self.columns[self.nKeys:] if not c.hidden]
 
     @property
     def keyColNames(self):
-        'Return string of key column names.'
-        return options.disp_key_sep.join(c.name for c in self.keyCols)
+        'String of key column names, for SheetsSheet convenience.'
+        return ' '.join(c.name for c in self.keyCols)
+
+    @property
+    def cursorCell(self):
+        'Displayed value (DisplayWrapper) at current row and column.'
+        return self.cursorCol.getCell(self.cursorRow)
+
+    @property
+    def cursorDisplay(self):
+        'Displayed value (DisplayWrapper.display) at current row and column.'
+        return self.cursorCol.getDisplayValue(self.cursorRow)
+
+    @property
+    def cursorTypedValue(self):
+        'Typed value at current row and column.'
+        return self.cursorCol.getTypedValue(self.cursorRow)
 
     @property
     def cursorValue(self):
-        'Return cell contents at current row and column.'
-        return self.cellValue(self.cursorRowIndex, self.cursorColIndex)
+        'Raw value at current row and column.'
+        return self.cursorCol.getValue(self.cursorRow)
 
     @property
     def statusLine(self):
-        'Return status-line element showing row and column stats.'
+        'String of row and column stats.'
         rowinfo = 'row %d/%d (%d selected)' % (self.cursorRowIndex, self.nRows, len(self._selectedRows))
         colinfo = 'col %d/%d (%d visible)' % (self.cursorColIndex, self.nCols, len(self.visibleCols))
         return '%s  %s' % (rowinfo, colinfo)
 
     @property
     def nRows(self):
-        'Return number of rows.'
+        'Number of rows on this sheet.'
         return len(self.rows)
 
     @property
     def nCols(self):
-        'Return number of columns.'
+        'Number of columns on this sheet.'
         return len(self.columns)
 
     @property
     def nVisibleCols(self):
-        'Return number of visible columns.'
+        'Number of visible columns on this sheet.'
         return len(self.visibleCols)
 
 ## selection code
-    def isSelected(self, r):
-        'Return boolean: is current row selected?'
-        return id(r) in self._selectedRows
+    def isSelected(self, row):
+        'True if given row is selected. O(log n).'
+        return id(row) in self._selectedRows
 
     @asyncthread
     def toggle(self, rows):
-        'Select any unselected rows.'
-        for r in self.genProgress(rows, len(self.rows)):
+        'Toggle selection of given `rows`.'
+        for r in Progress(rows, len(self.rows)):
             if not self.unselectRow(r):
                 self.selectRow(r)
 
     def selectRow(self, row):
-        'Select given row.'
+        'Select given row. O(log n)'
         self._selectedRows[id(row)] = row
 
     def unselectRow(self, row):
-        'Unselect given row, return True if selected; else return False.'
+        'Unselect given row, return True if selected; else return False. O(log n)'
         if id(row) in self._selectedRows:
             del self._selectedRows[id(row)]
             return True
@@ -1010,39 +1260,47 @@ class Sheet:
 
     @asyncthread
     def select(self, rows, status=True, progress=True):
-        'Select given rows with option for progress-tracking.'
+        "Select given rows. Don't show progress if progress=False; don't show status if status=False."
         before = len(self._selectedRows)
-        for r in (self.genProgress(rows) if progress else rows):
+        for r in (Progress(rows) if progress else rows):
             self.selectRow(r)
         if status:
-            self.vd.status('selected %s%s rows' % (len(self._selectedRows)-before, ' more' if before > 0 else ''))
+            vd().status('selected %s%s rows' % (len(self._selectedRows)-before, ' more' if before > 0 else ''))
 
     @asyncthread
     def unselect(self, rows, status=True, progress=True):
-        'Unselect given rows with option for progress-tracking.'
+        "Unselect given rows. Don't show progress if progress=False; don't show status if status=False."
         before = len(self._selectedRows)
-        for r in (self.genProgress(rows) if progress else rows):
+        for r in (Progress(rows) if progress else rows):
             self.unselectRow(r)
         if status:
-            self.vd.status('unselected %s/%s rows' % (before-len(self._selectedRows), before))
+            vd().status('unselected %s/%s rows' % (before-len(self._selectedRows), before))
 
     def selectByIdx(self, rowIdxs):
-        'Select given rows by index numbers.'
+        'Select given row indexes, without progress bar.'
         self.select((self.rows[i] for i in rowIdxs), progress=False)
 
     def unselectByIdx(self, rowIdxs):
-        'Unselect given rows by index numbers.'
+        'Unselect given row indexes, without progress bar.'
         self.unselect((self.rows[i] for i in rowIdxs), progress=False)
 
     def gatherBy(self, func):
-        'Yield each row matching the cursor value '
-        for r in self.genProgress(self.rows):
-            if func(r):
-                yield r
+        'Generate only rows for which the given func returns True.'
+        for r in Progress(self.rows):
+            try:
+                if func(r):
+                    yield r
+            except Exception:
+                pass
+
+    def orderBy(self, *cols, **kwargs):
+        self.rows.sort(key=lambda r,cols=cols: tuple(c.getTypedValue(r) for c in cols), **kwargs)
 
     @property
     def selectedRows(self):
-        'Return a list of selected rows in sheet order.'
+        'List of selected rows in sheet order. [O(nRows*log(nSelected))]'
+        if len(self._selectedRows) <= 1:
+            return list(self._selectedRows.values())
         return [r for r in self.rows if id(r) in self._selectedRows]
 
 ## end selection code
@@ -1054,12 +1312,12 @@ class Sheet:
         moveListItem(self.columns, fromColIdx, toColIdx)
         return toVisColIdx
 
-    def cursorDown(self, n):
-        "Increment cursor's row by `n`."
+    def cursorDown(self, n=1):
+        'Move cursor down `n` rows (or up if `n` is negative).'
         self.cursorRowIndex += n
 
-    def cursorRight(self, n):
-        "Increment cursor's column by `n`."
+    def cursorRight(self, n=1):
+        'Move cursor right `n` visible columns (or left if `n` is negative).'
         self.cursorVisibleColIndex += n
         self.calcColLayout()
 
@@ -1098,19 +1356,14 @@ class Sheet:
                     self.leftVisibleColIndex -= 1
                     self.calcColLayout()  # recompute rightVisibleColIndex
 
-    def cellValue(self, rownum, col):
-        'Return cell value for given row number and Column object.'
-        if not isinstance(col, Column):
-            # assume it's the column number
-            col = self.columns[col]
-        return col.getValue(self.rows[rownum])
-
     def addColumn(self, col, index=None):
-        'Insert column before current column or at given index.'
-        if index is None:
-            index = len(self.columns)
+        'Insert column at given index or after all columns.'
         if col:
+            if index is None:
+                index = len(self.columns)
+            col.sheet = self
             self.columns.insert(index, col)
+            return col
 
     def toggleKeyColumn(self, colidx):
         'Toggle column at given index as key column.'
@@ -1123,14 +1376,21 @@ class Sheet:
             moveListItem(self.columns, colidx, self.nKeys)
             return 0
 
+    def rowkey(self, row):
+        'returns a tuple of the key for the given row'
+        return tuple(c.getValue(row) for c in self.keyCols)
+
     def moveToNextRow(self, func, reverse=False):
         'Move cursor to next (prev if reverse) row for which func returns True.  Returns False if no row meets the criteria.'
         rng = range(self.cursorRowIndex-1, -1, -1) if reverse else range(self.cursorRowIndex+1, self.nRows)
 
         for i in rng:
-            if func(self.rows[i]):
-                self.cursorRowIndex = i
-                return True
+            try:
+                if func(self.rows[i]):
+                    self.cursorRowIndex = i
+                    return True
+            except Exception:
+                pass
 
         return False
 
@@ -1149,8 +1409,8 @@ class Sheet:
 
         if self.topRowIndex <= 0:
             self.topRowIndex = 0
-        elif self.topRowIndex > self.nRows-self.nVisibleRows:
-            self.topRowIndex = self.nRows-self.nVisibleRows
+        elif self.topRowIndex > self.nRows-1:
+            self.topRowIndex = self.nRows-1
 
         # (x,y) is relative cell within screen viewport
         x = self.cursorVisibleColIndex - self.leftVisibleColIndex
@@ -1183,18 +1443,24 @@ class Sheet:
 
     def calcColLayout(self):
         'Set right-most visible column, based on calculation.'
+        minColWidth = len(options.disp_more_left)+len(options.disp_more_right)
+        sepColWidth = len(options.disp_column_sep)
+        winWidth = self.vd.windowWidth
         self.visibleColLayout = {}
         x = 0
         vcolidx = 0
         for vcolidx in range(0, self.nVisibleCols):
             col = self.visibleCols[vcolidx]
             if col.width is None and self.visibleRows:
-                col.width = col.getMaxWidth(self.visibleRows)+len(options.disp_more_left)+len(options.disp_more_right)
-            width = col.width if col.width is not None else col.getMaxWidth(self.visibleRows)  # handle delayed column width-finding
+                # handle delayed column width-finding
+                col.width = col.getMaxWidth(self.visibleRows)+minColWidth
+                if vcolidx != self.nVisibleCols-1:  # let last column fill up the max width
+                    col.width = min(col.width, options.default_width)
+            width = col.width if col.width is not None else options.default_width
             if col in self.keyCols or vcolidx >= self.leftVisibleColIndex:  # visible columns
-                self.visibleColLayout[vcolidx] = [x, min(width, self.vd.windowWidth-x)]
-                x += width+len(options.disp_column_sep)
-            if x > self.vd.windowWidth-1:
+                self.visibleColLayout[vcolidx] = [x, min(width, winWidth-x)]
+                x += width+sepColWidth
+            if x > winWidth-1:
                 break
 
         self.rightVisibleColIndex = vcolidx
@@ -1216,7 +1482,7 @@ class Sheet:
 
         # ANameTC
         T = typemap.get(col.type, '?')
-        N = ' ' + (col.name or defaultColNames[vcolidx])  # save room at front for LeftMore
+        N = ' ' + col.name  # save room at front for LeftMore
         if len(N) > colwidth-1:
             N = N[:colwidth-len(options.disp_truncator)] + options.disp_truncator
         _clipdraw(scr, y, x, N, hdrattr, colwidth)
@@ -1238,11 +1504,14 @@ class Sheet:
         numHeaderRows = 1
         scr.erase()  # clear screen before every re-draw
 
+        vd().refresh()
+
         if not self.columns:
             return
 
         self.rowLayout = {}
         self.calcColLayout()
+        vcolidx = 0
         for vcolidx, colinfo in sorted(self.visibleColLayout.items()):
             x, colwidth = colinfo
             col = self.visibleCols[vcolidx]
@@ -1254,29 +1523,33 @@ class Sheet:
                 y = headerRow + numHeaderRows
 
                 for rowidx in range(0, self.nVisibleRows):
-                    if self.topRowIndex + rowidx >= self.nRows:
+                    dispRowIdx = self.topRowIndex + rowidx
+                    if dispRowIdx >= self.nRows:
                         break
 
-                    self.rowLayout[self.topRowIndex+rowidx] = y
+                    self.rowLayout[dispRowIdx] = y
 
-                    row = self.rows[self.topRowIndex + rowidx]
-                    cellval = col.getDisplayValue(row, colwidth-1)
+                    row = self.rows[dispRowIdx]
+                    cellval = col.getCell(row, colwidth-1)
 
                     attr = self.colorizeCell(col, row, cellval)
-                    sepattr = self.colorizeRow(row) or colors[options.color_column_sep]
+                    attrpre = 0
+                    sepattr = self.colorizeRow(row)
 
-                    _clipdraw(scr, y, x, options.disp_column_fill+cellval, attr, colwidth)
+                    # must apply current row here, because this colorization requires cursorRowIndex
+                    if dispRowIdx == self.cursorRowIndex:
+                        attr, attrpre = colors.update(attr, 0, options.color_current_row, 10)
+                        sepattr, _ = colors.update(sepattr, 0, options.color_current_row, 10)
 
-                    annotation = ''
-                    if isinstance(cellval, CalcErrorStr):
-                        annotation = options.disp_getter_exc
-                        notecolor = colors[options.color_getter_exc]
-                    elif isinstance(cellval, WrongTypeStr):
-                        annotation = options.disp_format_exc
-                        notecolor = colors[options.color_format_exc]
+                    sepattr = sepattr or colors[options.color_column_sep]
 
-                    if annotation:
-                        _clipdraw(scr, y, x+colwidth-len(annotation), annotation, notecolor, len(annotation))
+                    _clipdraw(scr, y, x, disp_column_fill+cellval.display, attr, colwidth)
+
+                    note = getattr(cellval, 'note', None)
+
+                    if note:
+                        noteattr, _ = colors.update(attr, attrpre, cellval.notecolor, 8)
+                        _clipdraw(scr, y, x+colwidth-len(note), note, noteattr, len(note))
 
                     sepchars = options.disp_column_sep
                     if (self.keyCols and col is self.keyCols[-1]) or vcolidx == self.rightVisibleColIndex:
@@ -1292,12 +1565,8 @@ class Sheet:
 
 
     def editCell(self, vcolidx=None, rowidx=None):
-        '''Call `editText` on given cell after setting other parameters.
+        'Call `editText` at its place on the screen.  Returns the new value, properly typed'
 
-        Return row after editing cell.'''
-        if options.readonly:
-            status('readonly mode')
-            return
         if vcolidx is None:
             vcolidx = self.cursorVisibleColIndex
         x, w = self.visibleColLayout.get(vcolidx, (0, 0))
@@ -1310,7 +1579,7 @@ class Sheet:
             currentValue = col.name
         else:
             y = self.rowLayout.get(rowidx, 0)
-            currentValue = self.cellValue(self.cursorRowIndex, col)
+            currentValue = col.getValue(self.rows[self.cursorRowIndex])
 
         r = self.vd.editText(y, x, w, value=currentValue, fillchar=options.disp_edit_fill, truncchar=options.disp_truncator)
         if rowidx >= 0:
@@ -1318,171 +1587,129 @@ class Sheet:
 
         return r
 
-class WrongTypeStr(str):
-    'Wrap `str` to indicate that type-conversion failed.'
-    pass
 
-class CalcErrorStr(str):
-    'Wrap `str` (perhaps with error message), indicating `getValue` failed.'
-    pass
-
-
-def distinct(values):
-    'Count unique elements in `values`.'
-    return len(set(values))
-
-def avg(values):
-    return float(sum(values))/len(values) if values else None
-
-mean=avg
-
-def count(values):
-    'Count total number of non-None elements.'
-    return len([x for x in values if x is not None])
-
-_sum = sum
-_max = max
-_min = min
-
-def sum(*values): return _sum(*values)
-def max(*values): return _max(*values)
-def min(*values): return _min(*values)
-
-avg.type = float
-count.type = int
-distinct.type = int
-sum.type = None
-min.type = None
-max.type = None
-aggregators = { '': None,
-                'distinct': distinct,
-                'sum': sum,
-                'avg': avg,
-                'mean': avg,
-                'count': count, # (non-None)
-                'min': min,
-                'max': max
-               }
+def isNullFunc():
+    'Returns isNull function according to current options.'
+    nullset = []
+    if options.none_is_null:  nullset.append(None)
+    if options.empty_is_null: nullset.append('')
+    if options.false_is_null: nullset.append(False)
+    if options.zero_is_null:  nullset.append(0)
+    return lambda v,nullset=nullset: v in nullset
 
 
 class Column:
-    def __init__(self, name, type=anytype, getter=lambda r: r, setter=None, width=None, fmtstr=None, cache=False):
-        self.name = name      # use property setter from the get-go to strip spaces
+    def __init__(self, name, type=anytype, cache=False, **kwargs):
+        self.sheet = None     # owning sheet, set in Sheet.addColumn
+        self.name = name      # display visible name
+        self.fmtstr = ''      # by default, use str()
         self.type = type      # anytype/str/int/float/date/func
-        self.getter = getter  # getter(r)
-        self.setter = setter  # setter(r,v)
-        self.width = width    # == 0 if hidden, None if auto-compute next time
-        self.expr = None      # Python string expression if computed column
-        self.aggregator = None # function to use on the list of column values when grouping
-        self.fmtstr = fmtstr
-        self._cachedValues = collections.OrderedDict() if cache else None
+        self.getter = lambda col, row: row
+        self.setter = None    # setter(col,row,value)
+        self.width = None     # == 0 if hidden, None if auto-compute next time
 
-    def copy(self):
-        return copy.copy(self)
+        self._cachedValues = collections.OrderedDict() if cache else None
+        for k, v in kwargs.items():
+            setattr(self, k, v)  # instead of __dict__.update(kwargs) to invoke property.setters
+
+    def __copy__(self):
+        cls = self.__class__
+        ret = cls.__new__(cls)
+        ret.__dict__.update(self.__dict__)
+        if ret._cachedValues:
+            ret._cachedValues = collections.OrderedDict()  # a fresh cache
+        return ret
+
+    def __deepcopy__(self, memo):
+        return self.__copy__()  # no separate deepcopy
 
     @property
     def name(self):
-        return self._name
+        return self._name or ''
 
     @name.setter
     def name(self, name):
-        if options.force_valid_names:
-            name = ''.join(c for c in str(name) if unicodedata.category(c) not in ('Cc', 'Zs', 'Zl'))  # control char, space, line sep
+        if isinstance(name, str):
+            name = name.strip()
+        if options.force_valid_colnames:
+            name = clean_to_id(name)
         self._name = name
 
-#######  cut; move global-getting into columnssheet
     @property
-    def type(self):
-        return self._type
+    def fmtstr(self):
+        if self._fmtstr:
+            return self._fmtstr
 
-    @type.setter
-    def type(self, t):
-        'Sets `_type` from t as either a typename or a callable. Revert to anytype if not callable.'
-        if isinstance(t, str):
-            t = globals()[t]
+        t = self.type
+        if t is int:      return '{:d}'
+        elif t is float:    return '{:.02f}'
+        elif t is currency: return '{:,.02f}'
 
-        if t:
-            assert callable(t)
-            self._type = t
-        else:
-            self._type = anytype
-
-    @property
-    def aggregator(self):
-        return self._aggregator
-
-    @aggregator.setter
-    def aggregator(self, aggfunc):
-        'Set `_aggregator` to given `aggfunc`, which is either a function or a string naming a global function.'
-        if isinstance(aggfunc, str):
-            if aggfunc:
-                aggfunc = globals()[aggfunc]
-
-        if aggfunc:
-            assert callable(aggfunc)
-            self._aggregator = aggfunc
-        else:
-            self._aggregator = None
-###### end cut
+    @fmtstr.setter
+    def fmtstr(self, v):
+        self._fmtstr = v
 
     def format(self, cellval):
         'Return displayable string of `cellval` according to our `Column.type` and `Column.fmtstr`'
+        if cellval is None:
+            return options.disp_none
 
-        if isinstance(cellval, (list, dict)):
-            # complex objects can be arbitrarily large (like sheet.rows)
-            return str(type(cellval))
+        # complex objects can be arbitrarily large (like sheet.rows)
+        #  this shortcut must be before self.type(cellval) (anytype will completely stringify)
+        if isinstance(cellval, list):
+            return '[%s]' % len(cellval)
+        if isinstance(cellval, dict):
+            return '{%s}' % len(cellval)
 
         t = self.type
-        val = t(cellval)
-        if t is date:         return val.to_string(self.fmtstr)
-        elif self.fmtstr is not None: return self.fmtstr.format(val)
-        elif t is int:        return '{:d}'.format(val)
-        elif t is float:      return '{:.02f}'.format(val)
-        elif t is currency:   return '{:,.02f}'.format(val)
-        else: return str(val)
+        typedval = t(cellval)
+        if t is date:         return typedval.to_string(self.fmtstr)
+        elif self.fmtstr:     return self.fmtstr.format(typedval)
+        else:                 return str(typedval)
 
     @property
     def hidden(self):
         'A column is hidden if its width == 0.'
         return self.width == 0
 
-    def nEmpty(self, rows):
-        'Count rows that are empty strings or None.'
-        vals = self.values(rows)
-        return sum(1 for v in vals if v == '' or v == None)
+    def getValueRows(self, rows):
+        'Generate (val, row) for the given `rows` at this Column, excluding errors and nulls.'
+        f = isNullFunc()
 
-    def values(self, rows):
-        'Return a list of values for the given `rows` at this Column.'
-        return [self.getValue(r) for r in rows]
+        for r in rows:
+            try:
+                v = self.type(self.getValue(r))
+                if not f(v):
+                    yield v, r
+            except Exception:
+                pass
 
-    def getValue(self, row):
+    def getValues(self, rows):
+        for v, r in self.getValueRows(rows):
+            yield v
+
+    def calcValue(self, row):
+        return (self.getter)(self, row)
+
+    def getTypedValue(self, row):
         '''Returns the properly-typed value for the given row at this column.
            Returns the type's default value if either the getter or the type conversion fails.'''
         try:
-            v = self.getter(row)
-        except EscapeException:
-            raise
-        except Exception:
-            exceptionCaught(status=False)
+            return self.type(self.getValue(row))
+        except Exception as e:
+#            exceptionCaught(e, status=False)
             return self.type()
 
-        try:
-            return self.type(v)  # convert type on-the-fly
-        except EscapeException:
-            raise
-        except Exception:
-            exceptionCaught(status=False)
-            return self.type()  # return a suitable value for this type
-
-    def getDisplayValue(self, row, width=None):
+    def getValue(self, row):
+        'Memoize calcValue with key id(row)'
         if self._cachedValues is None:
-            return self._getDisplayValue(row, width)
+            return self.calcValue(row)
 
-        k = (id(row), width)
+        k = id(row)
         if k in self._cachedValues:
             return self._cachedValues[k]
 
-        ret = self._getDisplayValue(row, width)
+        ret = self.calcValue(row)
         self._cachedValues[k] = ret
 
         if len(self._cachedValues) > 256:  # max number of entries
@@ -1490,41 +1717,68 @@ class Column:
 
         return ret
 
-    def _getDisplayValue(self, row, width=None):
-        'Format cell value for display and return.'
+    def getCell(self, row, width=None):
+        'Return DisplayWrapper for displayable cell value.'
         try:
-            cellval = self.getter(row)
-        except EscapeException:
-            raise
+            cellval = self.getValue(row)
         except Exception as e:
-            exceptionCaught(status=False)
-            return CalcErrorStr(options.disp_error_val)
+            return DisplayWrapper(None, error=stacktrace(),
+                                display=options.disp_error_val,
+                                note=options.note_getter_exc,
+                                notecolor=options.color_getter_exc)
 
-        if cellval is None:
-            return options.disp_none
+        if isinstance(cellval, threading.Thread):
+            return DisplayWrapper(None,
+                                display=options.disp_pending,
+                                note=options.note_pending,
+                                notecolor=options.color_note_pending)
 
         if isinstance(cellval, bytes):
             cellval = cellval.decode(options.encoding, options.encoding_errors)
 
-        try:
-            cellval = self.format(cellval)
-            if width and self._type in (int, float, currency):
-                cellval = cellval.rjust(width-1)
-        except EscapeException:
-            raise
-        except Exception as e:
-            exceptionCaught(status=False)
-            cellval = WrongTypeStr(str(cellval))
+        dw = DisplayWrapper(cellval)
 
-        return cellval
+        try:
+            dispval = self.format(cellval)
+            if width and self.type in (int, float, currency, len):
+                dispval = dispval.rjust(width-1)
+
+            dw.display = dispval
+
+            # annotate cells with raw value type in anytype columns
+            if self.type is anytype and options.color_note_type:
+                dw.note = typemap.get(type(cellval), None)
+                dw.notecolor = options.color_note_type
+
+        except Exception as e:  # type conversion or formatting failed
+            dw.error = stacktrace()
+            dw.display = str(cellval)
+            dw.note = options.note_format_exc
+            dw.notecolor = options.color_format_exc
+
+        return dw
+
+    def getDisplayValue(self, row):
+        return self.getCell(row).display
+
+    def setValue(self, row, value):
+        'Set our column value for given row to `value`.'
+        self.setter or error(self.name+' column cannot be changed')
+        self.setter(self, row, value)
 
     def setValues(self, rows, value):
-        'Set given rows to `value`.'
-        if not self.setter:
-            error('column cannot be changed')
+        'Set our column value for given list of rows to `value`.'
         value = self.type(value)
         for r in rows:
-            self.setter(r, value)
+            self.setValue(r, value)
+        status('set %d values = %s' % (len(rows), value))
+
+    @async
+    def setValuesFromExpr(self, rows, expr):
+        compiledExpr = compile(expr, '<expr>', 'eval')
+        for row in Progress(rows):
+            self.setValue(row, self.sheet.evalexpr(compiledExpr, row))
+        status('set %d values = %s' % (len(rows), expr))
 
     def getMaxWidth(self, rows):
         'Return the maximum length of any cell in column or its header.'
@@ -1543,71 +1797,116 @@ class Column:
 
 # ---- Column makers
 
-def ColumnAttr(attrname, type=anytype, **kwargs):
-    'Return Column object with `attrname` from current row Python object.'
-    return Column(attrname, type=type,
-            getter=lambda r,b=attrname: getattr(r,b),
-            setter=lambda r,v,b=attrname: setattr(r,b,v),
+def setitem(r, i, v):  # function needed for use in lambda
+    r[i] = v
+
+def ColumnAttr(name, attr=None, **kwargs):
+    'Column using getattr/setattr of given attr.'
+    if attr is None:
+        attr = name
+    return Column(name,
+            getter=lambda col,row,attr=attr: getattr(row, attr, None),
+            setter=lambda col,row,val,attr=attr: setattr(row, attr, val),
             **kwargs)
 
-def ColumnItem(attrname, itemkey, **kwargs):
-    'Return Column object (with getitem/setitem) on the row Python object.'
-    def setitem(r, i, v):  # function needed for use in lambda
-        r[i] = v
-
-    return Column(attrname,
-            getter=lambda r,i=itemkey: r[i],
-            setter=lambda r,v,i=itemkey,f=setitem: f(r,i,v),
+def ColumnItem(name, key=None, **kwargs):
+    'Column using getitem/setitem of given key.'
+    if key is None:
+        key = name
+    return Column(name,
+            getter=lambda col,row,key=key: row[key],
+            setter=lambda col,row,val,key=key: setitem(row, key, val),
             **kwargs)
 
 def ArrayNamedColumns(columns):
-    '''Return list of Column objects from named columns.
-
-    Note: argument `columns` is a list of column names, Mapping to r[0]..r[n].'''
+    'Return list of ColumnItems from given list of column names.'
     return [ColumnItem(colname, i) for i, colname in enumerate(columns)]
 
 def ArrayColumns(ncols):
-    '''Return list of Column objects.
-
-    Note: argument `ncols` is a count of columns,'''
+    'Return list of ColumnItems for given row length.'
     return [ColumnItem('', i, width=8) for i in range(ncols)]
 
-def SubrowColumn(origcol, subrowidx, **kwargs):
-    'Return Column object from sub-row.'
-    return Column(origcol.name, origcol.type,
-            getter=lambda r,i=subrowidx,f=origcol.getter: r[i] and f(r[i]) or None,
-            setter=lambda r,v,i=subrowidx,f=origcol.setter: r[i] and f(r[i], v) or None,
-            width=origcol.width,
-            **kwargs)
 
-def ColumnAttrNamedObject(name):
-    'Return an effective ColumnAttr which displays the __name__ of the object value.'
-    def _getattrname(o, k):
-        v = getattr(o, k)
+class SubrowColumn(Column):
+    def __init__(self, origcol, subrowidx, **kwargs):
+        super().__init__(origcol.name, type=origcol.type, width=origcol.width, **kwargs)
+        self.origcol = origcol
+        self.subrowidx = subrowidx
+
+    def getValue(self, row):
+        subrow = row[self.subrowidx]
+        if subrow is not None:
+            return self.origcol.getValue(subrow)
+
+    def setValue(self, row, value):
+        subrow = row[self.subrowidx]
+        if subrow is not None:
+           self.origcol.setValue(subrow, value)
+
+
+class DisplayWrapper:
+    def __init__(self, value, **kwargs):
+        self.value = value
+        self.__dict__.update(kwargs)
+
+
+class ColumnEnum(Column):
+    'types and aggregators. row.<name> should be kept to the values in the mapping m, and can be set by the a string key into the mapping.'
+    def __init__(self, name, m, default=None):
+        super().__init__(name)
+        self.mapping = m
+        self.default = default
+
+    def getValue(self, row):
+        v = getattr(row, self.name, None)
         return v.__name__ if v else None
 
-    return Column(name, getter=lambda r,name=name: _getattrname(r, name),
-                        setter=lambda r,v,name=name: setattr(r, name, v))
+    def setValue(self, row, value):
+        if isinstance(value, str):  # first try to get the actual value from the mapping
+            value = self.mapping.get(value, value)
+        setattr(row, self.name, value or self.default)
 
 
-def input(prompt, type='', **kwargs):
-    'Compose input prompt.'
-    if type:
-        ret = _inputLine(prompt, history=list(vd().lastInputs[type].keys()), **kwargs)
-        vd().lastInputs[type][ret] = ret
-    else:
-        ret = _inputLine(prompt, **kwargs)
-    return ret
+class LazyMapRow:
+    'Calculate column values as needed.'
+    def __init__(self, sheet, row):
+        self.row = row
+        self.sheet = sheet
+        self._keys = [c.name for c in self.sheet.columns]
 
-def _inputLine(prompt, **kwargs):
-    'Add prompt to bottom of screen and get line of input from user.'
-    scr = vd().scr
-    if scr:
-        scr.addstr(vd().windowHeight-1, 0, prompt)
-    vd().inInput = True
-    ret = vd().editText(vd().windowHeight-1, len(prompt), vd().windowWidth-len(prompt)-8, attr=colors[options.color_edit_cell], unprintablechar=options.disp_unprintable, **kwargs)
-    vd().inInput = False
-    return ret
+    def keys(self):
+        return self._keys
+
+    def __getitem__(self, colid):
+        try:
+            i = self._keys.index(colid)
+            return self.sheet.columns[i].getTypedValue(self.row)
+        except ValueError:
+            if colid in ['row', '__row__']:
+                return self.row
+            elif colid in ['sheet', '__sheet__']:
+                return self.sheet
+            raise KeyError(colid)
+
+
+class ColumnExpr(Column):
+    def __init__(self, name, expr=None):
+        super().__init__(name)
+        self.expr = expr or name
+
+    def calcValue(self, row):
+        return self.sheet.evalexpr(self.compiledExpr, row)
+
+    @property
+    def expr(self):
+        return self._expr
+
+    @expr.setter
+    def expr(self, expr):
+        self._expr = expr
+        self.compiledExpr = compile(expr, '<expr>', 'eval')
+
+###
 
 def confirm(prompt):
     yn = input(prompt, value='n')[:1]
@@ -1615,13 +1914,14 @@ def confirm(prompt):
         error('disconfirmed')
 
 import unicodedata
+@functools.lru_cache(maxsize=8192)
 def clipstr(s, dispw):
     '''Return clipped string and width in terminal display characters.
 
     Note: width may differ from len(s) if East Asian chars are 'fullwidth'.'''
     w = 0
     ret = ''
-    ambig_width = options.unicode_ambiguous_width
+    ambig_width = options.disp_ambig_width
     for c in s:
         if c != ' ' and unicodedata.category(c) in ('Cc', 'Zs', 'Zl'):  # control char, space, line sep
             ret += options.disp_oddspace
@@ -1644,126 +1944,138 @@ def clipstr(s, dispw):
     return ret, w
 
 
-## Built-in sheets
-
 ## text viewer and dir browser
+# rowdef: (linenum, str)
 class TextSheet(Sheet):
-    'Sheet displaying a string (one line per row) or a list of strings.'
+    'Displays any iterable source, with linewrap if wrap set in init kwargs or options.'
+    rowtype = 'lines'
+    commands = [
+        Command('v', 'sheet.wrap = not getattr(sheet, "wrap", options.wrap); status("text%s wrapped" % ("" if wrap else " NOT")); reload()', 'toggle text wrap for this sheet')
+    ]
+    filetype = 'txt'
+
+    def __init__(self, name, source, **kwargs):
+        super().__init__(name, source=source, **kwargs)
 
     @asyncthread
     def reload(self):
-        'Populate sheet via `reload` function.'
+        self.columns = [Column(self.name, getter=lambda col,row: row[1])]
         self.rows = []
-        self.columns = [Column(self.name, width=self.vd.windowWidth, getter=lambda r: r[1])]
-        if isinstance(self.source, list):
-            for x in self.source:
-                # copy so modifications don't change 'original'; also one iteration through generator
-                self.addLine(x)
-        elif isinstance(self.source, str):
-            for L in self.source.splitlines():
-                self.addLine(L)
-        elif isinstance(self.source, io.IOBase):
-            for L in self.source:
-                self.addLine(L[:-1])
-        elif isinstance(self.source, Path):
-            for L in self.source.open_text():
-                self.addLine(L[:-1])
-        else:
-            error('unknown text type ' + str(type(self.source)))
-
-    def addLine(self, text):
-        'Handle text re-wrapping.'
-        if options.textwrap:
-            startingLine = len(self.rows)
-            for i, L in enumerate(textwrap.wrap(text, width=self.vd.windowWidth-2)):
-                self.rows.append((startingLine+i, L))
-        else:
-            self.rows.append((len(self.rows), text))
+        winWidth = vd().windowWidth
+        for text in self.source:
+            if getattr(self, 'wrap', options.wrap):
+                startingLine = len(self.rows)
+                for i, L in enumerate(textwrap.wrap(str(text), width=winWidth-2)):
+                    self.addRow((startingLine+i, L))
+            else:
+                self.addRow((len(self.rows), text))
 
 class ColumnsSheet(Sheet):
-    def __init__(self, srcsheet):
-        super().__init__(srcsheet.name + '_columns', srcsheet)
+    rowtype = 'columns'
+    class ValueColumn(Column):
+        'passthrough to the value on the source cursorRow'
+        def calcValue(self, srcCol):
+            return srcCol.getDisplayValue(srcCol.sheet.cursorRow)
+        def setValue(self, srcCol, val):
+            srcCol.setValue(self.sheet.source.cursorRow, val)
 
-        self.addColorizer('row', 8, lambda self,c,r,v: options.color_key_col if r in self.source.keyCols else None)
-
-        self.columns = [
-            ColumnAttr('name', str),
-            ColumnAttr('width', int),
-            ColumnAttrNamedObject('type'),
-            ColumnAttr('fmtstr', str),
-            Column('value',  anytype, lambda c,sheet=self.source: c.getDisplayValue(sheet.cursorRow)),
-        ]
+    columns = [
+            ColumnAttr('sheet'),
+            ColumnAttr('name'),
+            ColumnAttr('width', type=int),
+            ColumnEnum('type', globals(), default=anytype),
+            ColumnAttr('fmtstr'),
+            ValueColumn('value')
+    ]
+    nKeys = 2
+    colorizers = [
+            Colorizer('row', 7, lambda self,c,r,v: options.color_key_col if r in r.sheet.keyCols else None),
+    ]
+    commands = []
 
     def reload(self):
-        self.rows = self.source.columns
-
+        if isinstance(self.source, Sheet):
+            self.rows = self.source.columns
+            self.cursorRowIndex = self.source.cursorColIndex
+            self.columns[0].width = 0  # hide 'sheet' column if only one sheet
+        else:  # lists of Columns
+            self.rows = []
+            for src in self.source:
+                if src is not self:
+                    self.rows.extend(src.columns)
 
 class SheetsSheet(Sheet):
-    def __init__(self):
-        super().__init__('sheets', vd().sheets,
-                columns=list(ColumnAttr(name) for name in 'name nRows nCols nVisibleCols cursorValue keyColNames source'.split()))
+    rowtype = 'sheets'
+    commands = [Command(ENTER, 'jumpTo(cursorRowIndex)', 'jump to sheet referenced in current row')]
+    columns = [
+        ColumnAttr('name'),
+        ColumnAttr('nRows', type=int),
+        ColumnAttr('nCols', type=int),
+        ColumnAttr('nVisibleCols', type=int),
+        ColumnAttr('cursorDisplay'),
+        ColumnAttr('keyColNames'),
+        ColumnAttr('source'),
+    ]
 
     def reload(self):
         self.rows = vd().sheets
-        self.command(ENTER, 'moveListItem(vd.sheets, cursorRowIndex, 0); vd.sheets.pop(1)', 'jump to this sheet')
+
+    def jumpTo(self, sheetnum):
+        if sheetnum != 0:
+            moveListItem(self.rows, sheetnum, 0)
+            self.rows.pop(1)
 
 
 class HelpSheet(Sheet):
     'Show all commands available to the source sheet.'
-    def reload(self):
-        self.columns = [ColumnItem('keystrokes', 0),
-                        ColumnItem('action', 1),
-                        Column('with_g_prefix', str, lambda r,self=self: self.source.commands.get('g'+r[0], (None,'-'))[1]),
-                        ColumnItem('execstr', 2, width=0),
-                ]
-        self.nKeys = 1
+    rowtype = 'commands'
 
+    class HelpColumn(Column):
+        def calcValue(self, r):
+            cmd = self.sheet.source.getCommand(self.prefix+r.name, None)
+            return cmd.helpstr if cmd else '-'
+
+    columns = [
+        ColumnAttr('keystrokes', 'name'),
+        ColumnAttr('helpstr'),
+        HelpColumn('with_g_prefix', prefix='g'),
+        HelpColumn('with_z_prefix', prefix='z'),
+        ColumnAttr('execstr', width=0),
+    ]
+    nKeys = 1
+    def reload(self):
         self.rows = []
-        for src in self.source.commands.maps:
+        for src in self.source._commands.maps:
             self.rows.extend(src.values())
 
 
-class OptionsObject:
-    'minimalist options framework'
-    def __init__(self, d):
-        object.__setattr__(self, '_opts', d)
-
-    def __getattr__(self, k):
-        name, value, default, helpstr = self._opts[k]
-        return value
-
-    def __setattr__(self, k, v):
-        self.__setitem__(k, v)
-
-    def __setitem__(self, k, v):
-        if k not in self._opts:
-            raise Exception('no such option "%s"' % k)
-        self._opts[k][1] = type(self._opts[k][1])(v)
-
-options = OptionsObject(baseOptions)
-
-
 class OptionsSheet(Sheet):
-    def __init__(self, d):
-        super().__init__('options', d)
-        self.columns = ArrayNamedColumns('option value default description'.split())
-        self.command([ENTER, 'e'], 'source[cursorRow[0]] = editCell(1)', 'edit this option')
-        self.nKeys = 1
+    rowtype = 'options'
+    commands = [
+        Command(ENTER, 'editOption(cursorRow)', 'edit option'),
+        Command('e', ENTER)
+    ]
+    columns = [ColumnItem('option', 0),
+               Column('value', getter=lambda col,row: row[1], setter=lambda col,row,val: setattr(options, row[0], val)),
+               ColumnItem('default', 2),
+               ColumnItem('description', 3)]
+    colorizers = []
+    nKeys = 1
+
+    def editOption(self, row):
+        if isinstance(row[2], bool):
+            self.source[row[0]] = not row[1]
+        else:
+            self.source[row[0]] = self.editCell(1)
 
     def reload(self):
         self.rows = list(self.source._opts.values())
 
-vd().optionsSheet = OptionsSheet(options)
-
-# A .. Z AA AB .. ZY ZZ
-defaultColNames = list(''.join(j) for i in range(options.maxlen_col_hdr)
-                             for j in itertools.product(string.ascii_uppercase,
-                                   repeat=i+1)
-                  )
+vd().optionsSheet = OptionsSheet('options', source=options)
 
 ### Curses helpers
 
-def _clipdraw(scr, y, x, s, attr, w):
+def clipdraw(scr, y, x, s, attr, w=None):
     'Draw string `s` at (y,x)-(y,x+w), clipping with ellipsis char.'
     _, windowWidth = scr.getmaxyx()
     dispw = 0
@@ -1776,15 +2088,17 @@ def _clipdraw(scr, y, x, s, attr, w):
 
         # convert to string just before drawing
         s, dispw = clipstr(str(s), w)
-        scr.addstr(y, x, options.disp_column_fill*w, attr)
+        scr.addstr(y, x, disp_column_fill*w, attr)
         scr.addstr(y, x, s, attr)
     except Exception as e:
 #        raise type(e)('%s [clip_draw y=%s x=%s dispw=%s w=%s]' % (e, y, x, dispw, w)
 #                ).with_traceback(sys.exc_info()[2])
         pass
 
+_clipdraw = clipdraw
+
 # https://stackoverflow.com/questions/19833315/running-system-commands-in-python-using-curses-and-panel-and-come-back-to-previ
-class suspend_curses():
+class SuspendCurses:
     'Context Manager to temporarily leave curses mode'
     def __enter__(self):
         curses.endwin()
@@ -1794,8 +2108,44 @@ class suspend_curses():
         newscr.refresh()
         curses.doupdate()
 
+class EnableCursor:
+    def __enter__(self):
+        with suppress(curses.error):
+            curses.mousemask(0)
+            curses.curs_set(1)
+
+    def __exit__(self, exc_type, exc_val, tb):
+        with suppress(curses.error):
+            curses.curs_set(0)
+            curses.mousemask(-1)
+
+def launchExternalEditor(v, linenum=0):
+    editor = os.environ.get('EDITOR') or error('$EDITOR not set')
+
+    import tempfile
+    fd, fqpn = tempfile.mkstemp(text=True)
+    with open(fd, 'w') as fp:
+        fp.write(v)
+
+    with SuspendCurses():
+        cmd = '%s %s' % (editor, fqpn)
+        if linenum:
+            cmd += ' +%s' % linenum
+        os.system(cmd)
+
+    with open(fqpn, 'r') as fp:
+        return fp.read()
+
+def suspend():
+    import signal
+    with SuspendCurses():
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+# history: earliest entry first
 def editText(scr, y, x, w, attr=curses.A_NORMAL, value='', fillchar=' ', truncchar='-', unprintablechar='.', completer=lambda text,idx: None, history=[], display=True):
     'A better curses line editing widget.'
+    ESC='^['
+    ENTER='^J'
 
     def until_get_wch():
         'Ignores get_wch timeouts'
@@ -1803,7 +2153,7 @@ def editText(scr, y, x, w, attr=curses.A_NORMAL, value='', fillchar=' ', truncch
         while not ret:
             try:
                 ret = scr.get_wch()
-            except _curses.error:
+            except curses.error:
                 pass
 
         return ret
@@ -1812,7 +2162,7 @@ def editText(scr, y, x, w, attr=curses.A_NORMAL, value='', fillchar=' ', truncch
         'Insert `s` into string `v` at `i` (such that v[i] == s[0]).'
         return v if i < 0 else v[:i] + s + v[i:]
 
-    def clean(s):
+    def clean_printable(s):
         'Escape unprintable characters.'
         return ''.join(c if c.isprintable() else ('<%04X>' % ord(c)) for c in str(s))
 
@@ -1820,41 +2170,85 @@ def editText(scr, y, x, w, attr=curses.A_NORMAL, value='', fillchar=' ', truncch
         'Delete `remove` characters from str `s` beginning at position `i`.'
         return s if i < 0 else s[:i] + s[i+remove:]
 
-    def complete(v, comps, cidx):
-        'Complete keystroke `v` based on list `comps` of completions.'
-        if comps:
-            for i in range(cidx, cidx + len(comps)):
-                i %= len(comps)
-                if comps[i].startswith(v):
-                    return comps[i]
-        # beep
-        return v
+    class CompleteState:
+        def __init__(self, completer_func):
+            self.comps_idx = -1
+            self.completer_func = completer_func
+            self.former_i = None
+            self.just_completed = False
 
-    def launchExternalEditor(v):
-        editor = os.environ.get('EDITOR') or error('$EDITOR not set')
+        def complete(self, v, i, state_incr):
+            self.just_completed = True
+            self.comps_idx += state_incr
 
-        import tempfile
-        fd, fqpn = tempfile.mkstemp(text=True)
-        with open(fd, 'w') as fp:
-            fp.write(v)
+            if self.former_i is None:
+                self.former_i = i
+            try:
+                r = self.completer_func(v[:self.former_i], self.comps_idx)
+            except Exception as e:
+                # beep/flash; how to report exception?
+                return v, i
 
-        with suspend_curses():
-            os.system('%s %s' % (editor, fqpn))
+            if not r:
+                # beep/flash to indicate no matches?
+                return v, i
 
-        with open(fqpn, 'r') as fp:
-            return fp.read()
+            v = r + v[i:]
+            return v, len(v)
 
+        def reset(self):
+            if self.just_completed:
+                self.just_completed = False
+            else:
+                self.former_i = None
+                self.comps_idx = -1
+
+    class HistoryState:
+        def __init__(self, history):
+            self.history = history
+            self.hist_idx = None
+            self.prev_val = None
+
+        def up(self, v, i):
+            if self.hist_idx is None:
+                self.hist_idx = len(self.history)
+                self.prev_val = v
+            if self.hist_idx > 0:
+                self.hist_idx -= 1
+                v = self.history[self.hist_idx]
+            i = len(v)
+            return v, i
+
+        def down(self, v, i):
+            if self.hist_idx is None:
+                return v, i
+            elif self.hist_idx < len(self.history)-1:
+                self.hist_idx += 1
+                v = self.history[self.hist_idx]
+            else:
+                v = self.prev_val
+                self.hist_idx = None
+            i = len(v)
+            return v, i
+
+    history_state = HistoryState(history)
+    complete_state = CompleteState(completer)
     insert_mode = True
     first_action = True
     v = str(value)  # value under edit
     i = 0           # index into v
-    comps_idx = -1
-    hist_idx = 0
     left_truncchar = right_truncchar = truncchar
+
+    def rfind_nonword(s, a, b):
+        while not s[b].isalnum() and b >= a:  # first skip non-word chars
+            b -= 1
+        while s[b].isalnum() and b >= a:
+            b -= 1
+        return b
 
     while True:
         if display:
-            dispval = clean(v)
+            dispval = clean_printable(v)
         else:
             dispval = '*' * len(v)
 
@@ -1886,17 +2280,19 @@ def editText(scr, y, x, w, attr=curses.A_NORMAL, value='', fillchar=' ', truncch
         elif ch == '^E' or ch == 'KEY_END':        i = len(v)
         elif ch == '^F' or ch == 'KEY_RIGHT':      i += 1
         elif ch in ('^H', 'KEY_BACKSPACE', '^?'):  i -= 1; v = delchar(v, i)
-        elif ch == '^I':                           comps_idx += 1; v = completer(v[:i], comps_idx) or v
-        elif ch == 'KEY_BTAB':                     comps_idx -= 1; v = completer(v[:i], comps_idx) or v
+        elif ch == '^I':                           v, i = complete_state.complete(v, i, +1)
+        elif ch == 'KEY_BTAB':                     v, i = complete_state.complete(v, i, -1)
         elif ch == ENTER:                          break
         elif ch == '^K':                           v = v[:i]  # ^Kill to end-of-line
+        elif ch == '^O':                           v = launchExternalEditor(v)
         elif ch == '^R':                           v = str(value)  # ^Reload initial value
         elif ch == '^T':                           v = delchar(splice(v, i-2, v[i-1]), i)  # swap chars
         elif ch == '^U':                           v = v[i:]; i = 0  # clear to beginning
         elif ch == '^V':                           v = splice(v, i, until_get_wch()); i += 1  # literal character
-        elif ch == '^Z':                           v = launchExternalEditor(v)
-        elif history and ch == 'KEY_UP':           hist_idx += 1; v = history[hist_idx % len(history)]
-        elif history and ch == 'KEY_DOWN':         hist_idx -= 1; v = history[hist_idx % len(history)]
+        elif ch == '^W':                           j = rfind_nonword(v, 0, i-1); v = v[:j+1] + v[i:]; i = j+1
+        elif ch == '^Z':                           v = suspend()
+        elif history and ch == 'KEY_UP':           v, i = history_state.up(v, i)
+        elif history and ch == 'KEY_DOWN':         v, i = history_state.down(v, i)
         elif ch.startswith('KEY_'):                pass
         else:
             if first_action:
@@ -1911,6 +2307,7 @@ def editText(scr, y, x, w, attr=curses.A_NORMAL, value='', fillchar=' ', truncch
         if i < 0: i = 0
         if i > len(v): i = len(v)
         first_action = False
+        complete_state.reset()
 
     return v
 
@@ -1921,10 +2318,16 @@ class ColorMaker:
         self.color_attrs = {}
 
     def setup(self):
+        if options.use_default_colors:
+            curses.use_default_colors()
+            default_bg = -1
+        else:
+            default_bg = curses.COLOR_BLACK
+
         self.color_attrs['black'] = curses.color_pair(0)
 
-        for c in range(0, int(options.num_colors) or curses.COLORS):
-            curses.init_pair(c+1, c, curses.COLOR_BLACK)
+        for c in range(0, options.force_256_colors and 256 or curses.COLORS):
+            curses.init_pair(c+1, c, default_bg)
             self.color_attrs[str(c)] = curses.color_pair(c+1)
 
         for c in 'red green yellow blue magenta cyan white'.split():
@@ -1960,8 +2363,14 @@ colors = ColorMaker()
 def setupcolors(stdscr, f, *args):
     curses.raw()    # get control keys instead of signals
     curses.meta(1)  # allow "8-bit chars"
-#    curses.mousemask(curses.ALL_MOUSE_EVENTS)  # enable mouse events
-#    curses.mouseinterval(0)
+    curses.mousemask(-1) # even more than curses.ALL_MOUSE_EVENTS
+    curses.mouseinterval(0) # very snappy but does not allow for [multi]click
+    curses.mouseEvents = {}
+
+    for k in dir(curses):
+        if k.startswith('BUTTON') or k == 'REPORT_MOUSE_POSITION':
+            curses.mouseEvents[getattr(curses, k)] = k
+
     return f(stdscr, *args)
 
 def wrapper(f, *args):
@@ -1969,82 +2378,7 @@ def wrapper(f, *args):
 
 ### external interface
 
-class Path:
-    'File and path-handling class, modeled on `pathlib.Path`.'
-    def __init__(self, fqpn):
-        self.fqpn = fqpn
-        fn = os.path.split(fqpn)[-1]
-
-        # check if file is gzip-compressed
-        if fn.endswith('.gz'):
-            self.gzip_compressed = True
-            fn = fn[:-3]
-        else:
-            self.gzip_compressed = False
-
-        self.name, self.ext = os.path.splitext(fn)
-        self.suffix = self.ext[1:]
-
-    def open_text(self, mode='r'):
-        if self.gzip_compressed:
-            return gzip.open(self.resolve(), mode='rt', encoding=options.encoding, errors=options.encoding_errors)
-        else:
-            return open(self.resolve(), mode=mode, encoding=options.encoding, errors=options.encoding_errors)
-
-    def read_text(self):
-        with self.open_text() as fp:
-            return fp.read()
-
-    def read_bytes(self):
-        with open(self.resolve(), 'rb') as fp:
-            return fp.read()
-
-    def is_dir(self):
-        return os.path.isdir(self.resolve())
-
-    def exists(self):
-        return os.path.exists(self.resolve())
-
-    def iterdir(self):
-        return [self.parent] + [Path(os.path.join(self.fqpn, f)) for f in os.listdir(self.resolve())]
-
-    def stat(self):
-        return os.stat(self.resolve())
-
-    def resolve(self):
-        'Resolve pathname shell variables and ~userdir'
-        return os.path.expandvars(os.path.expanduser(self.fqpn))
-
-    def relpath(self, start):
-        return os.path.relpath(os.path.realpath(self.resolve()), start)
-
-    @property
-    def parent(self):
-        'Return Path to parent directory.'
-        return Path(self.fqpn + "/..")
-
-    @property
-    def filesize(self):
-        return self.stat().st_size
-
-    def __str__(self):
-        return self.fqpn
-
-
-class InternalSource(Path):
-    'minimal Path interface to satisfy a tsv loader'
-    def __init__(self, fqpn, contents):
-        super().__init__(fqpn)
-        self.contents = contents
-
-    def read_text(self):
-        return self.contents
-
-    def open_text(self):
-        return io.StringIO(self.contents)
-
-
-def run(sheetlist=[]):
+def run(*sheetlist):
     'Main entry point; launches vdtui with the given sheets already pushed (last one is visible)'
 
     # reduce ESC timeout to 25ms. http://en.chys.info/2009/09/esdelay-ncurses/
@@ -2054,13 +2388,7 @@ def run(sheetlist=[]):
     if ret:
         print(ret)
 
-def cursorEnable(b):
-    try:
-        curses.curs_set(1 if b else 0)
-    except:
-        pass
-
-def cursesMain(_scr, sheetlist=[]):
+def cursesMain(_scr, sheetlist):
     'Populate VisiData object with sheets from a given list.'
 
     colors.setup()
@@ -2079,4 +2407,4 @@ def getGlobals():
     return globals()
 
 if __name__ == '__main__':
-    run(TextSheet('contents', Path(src)) for src in sys.argv[1:])
+    run(*(TextSheet('contents', open(src)) for src in sys.argv[1:]))
